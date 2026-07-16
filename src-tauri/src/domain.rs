@@ -238,6 +238,71 @@ pub struct DashboardSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct HistoryPoint {
+    pub timestamp_ms: i64,
+    pub average_latency_ms: Option<f64>,
+    pub minimum_latency_ms: Option<f64>,
+    pub maximum_latency_ms: Option<f64>,
+    pub sample_count: u64,
+    pub failure_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityIntervalRecord {
+    pub start_ms: i64,
+    pub end_ms: Option<i64>,
+    pub state: QualityState,
+    pub reasons: Vec<QualityReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeSummary {
+    pub sample_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub packet_loss_percent: f64,
+    pub average_latency_ms: Option<f64>,
+    pub minimum_latency_ms: Option<f64>,
+    pub maximum_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub stable_ms: i64,
+    pub unstable_ms: i64,
+    pub disconnected_ms: i64,
+    pub stable_percent: f64,
+    pub unstable_percent: f64,
+    pub disconnected_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySeries {
+    pub target: Target,
+    pub points: Vec<HistoryPoint>,
+    pub intervals: Vec<QualityIntervalRecord>,
+    pub summary: RangeSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryResponse {
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub bucket_ms: i64,
+    pub series: Vec<HistorySeries>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageInfo {
+    pub data_directory: String,
+    pub database_path: String,
+    pub database_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub retention_days: Option<u32>,
     pub notifications_enabled: bool,
