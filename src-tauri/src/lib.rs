@@ -1,4 +1,7 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod domain;
+pub mod probe;
+pub mod quality;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
