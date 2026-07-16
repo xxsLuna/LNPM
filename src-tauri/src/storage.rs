@@ -206,6 +206,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn close_open_intervals(&self, timestamp_ms: i64) -> StorageResult<u64> {
+        let connection = self.open()?;
+        let changed = connection.execute(
+            "UPDATE quality_intervals SET end_ms = ?1 WHERE end_ms IS NULL",
+            [timestamp_ms],
+        )?;
+        Ok(changed as u64)
+    }
+
     pub fn load_settings(&self) -> StorageResult<AppSettings> {
         let connection = self.open()?;
         let json = connection

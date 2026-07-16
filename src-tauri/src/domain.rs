@@ -148,7 +148,7 @@ impl PingSample {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityState {
     WarmingUp,
@@ -205,6 +205,14 @@ pub struct StateTransition {
     pub to: QualityState,
     pub effective_at_ms: i64,
     pub reasons: Vec<QualityReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityTransitionEvent {
+    pub target: Target,
+    pub transition: StateTransition,
+    pub metrics: QualityMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

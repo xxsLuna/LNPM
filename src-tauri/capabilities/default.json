@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for LNPM desktop windows",
+  "windows": ["main", "popup"],
   "permissions": [
     "core:default",
     "opener:default"

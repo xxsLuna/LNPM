@@ -19,7 +19,21 @@
         "height": 720,
         "minWidth": 900,
         "minHeight": 600,
-        "center": true
+        "center": true,
+        "visible": false
+      },
+      {
+        "label": "popup",
+        "title": "LNPM Status",
+        "url": "index.html?view=popup",
+        "width": 420,
+        "height": 320,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": true
       }
     ],
     "security": {
