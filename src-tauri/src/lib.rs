@@ -37,7 +37,8 @@ pub fn run() {
                 })?;
             let database = Database::new(data_directory)?;
             let settings = database.load_settings()?;
-            let probe = SurgePingProbe::new().map_err(io::Error::other)?;
+            let probe =
+                tauri::async_runtime::block_on(SurgePingProbe::new()).map_err(io::Error::other)?;
             let event_sink = TauriEventSink::new(app.handle().clone(), database.clone());
             let monitor = MonitorService::new(database.clone(), probe, event_sink);
             monitor.start_all()?;

@@ -84,12 +84,6 @@ impl MonitorEventSink for TauriEventSink {
     fn quality_transition(&self, event: QualityTransitionEvent) {
         let _ = self.app.emit("quality-transition", &event);
         self.notify_transition(&event);
-        if matches!(
-            event.transition.to,
-            QualityState::Unstable | QualityState::Disconnected | QualityState::Stable
-        ) {
-            show_popup_window(&self.app, None);
-        }
     }
 
     fn monitor_error(&self, target_id: Option<&str>, message: &str) {
@@ -156,6 +150,11 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
         WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
             api.prevent_close();
             let _ = window.hide();
+        }
+        WindowEvent::Resized(_) if window.label() == "main" => {
+            if window.is_minimized().unwrap_or(false) {
+                let _ = window.hide();
+            }
         }
         WindowEvent::Focused(false) if window.label() == "popup" => {
             let _ = window.hide();

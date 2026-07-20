@@ -25,7 +25,7 @@ pub struct SurgePingProbe {
 }
 
 impl SurgePingProbe {
-    pub fn new() -> Result<Arc<Self>, String> {
+    pub async fn new() -> Result<Arc<Self>, String> {
         let client_v4 = Client::new(&Config::default()).map_err(|error| error.to_string())?;
         let client_v6 = Client::new(&Config::builder().kind(ICMP::V6).build())
             .map_err(|error| error.to_string())?;
@@ -137,5 +137,10 @@ mod tests {
             AddressFamily::Ipv6
         ));
         assert!(family_matches("::1".parse().unwrap(), AddressFamily::Ipv6));
+    }
+
+    #[tokio::test]
+    async fn initializes_clients_inside_a_tokio_runtime() {
+        let _ = SurgePingProbe::new().await;
     }
 }
