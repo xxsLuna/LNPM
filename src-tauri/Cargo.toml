@@ -24,10 +24,10 @@ tauri-build = { version = "2", features = [] }
 async-trait = "0.1"
 directories = "6"
 parking_lot = "0.12"
-rusqlite = { version = "0.37", features = ["backup", "bundled"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-surge-ping = "0.8.4"
+surge-ping = "0.9.0"
 tauri = { version = "2.11", features = ["image-png", "tray-icon"] }
 tauri-plugin-autostart = "2.5"
 tauri-plugin-notification = "2"
