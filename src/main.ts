@@ -1,6 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 import { api } from "./api";
 import { LatencyChart } from "./chart";
@@ -10,6 +10,7 @@ import {
   formatError,
   formatLatency,
   formatPercent,
+  normalizeError,
   probeStatusLabel,
   reasonLabel,
   resolveLanguage,
@@ -28,7 +29,15 @@ import type {
   QualityTransitionEvent,
   Target,
   UserErrorPayload,
+  UpdateErrorEvent,
+  UpdateInfo,
+  UpdateProgressEvent,
 } from "./types";
+import {
+  initialUpdateUiState,
+  reduceUpdateUiState,
+  type UpdateUiState,
+} from "./update-state";
 import "./styles.css";
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
@@ -43,6 +52,9 @@ let settings: AppSettings = {
   startAtLogin: false,
   language: "auto",
   firstRun: true,
+  updateDeferredVersion: null,
+  updateDeferredUntilMs: null,
+  skippedUpdateVersion: null,
 };
 let language: Language = resolveLanguage(settings.language);
 let dashboard: DashboardSnapshot = { nowMs: Date.now(), paused: false, targets: [] };
@@ -52,6 +64,8 @@ let chart: LatencyChart | null = null;
 let loadGeneration = 0;
 let currentRange = { fromMs: Date.now() - 3_600_000, toMs: Date.now() };
 let followLive = true;
+let updateUiState: UpdateUiState = initialUpdateUiState;
+let currentAppVersion: string | null = null;
 
 void bootstrap();
 
@@ -88,6 +102,27 @@ async function bootstrap(): Promise<void> {
     preserveViewState();
     window.setTimeout(() => location.reload(), 50);
   });
+  await listen<UpdateInfo>("update-available", (event) => {
+    void showAvailableUpdate(event.payload);
+  });
+  await listen<UpdateProgressEvent>("update-progress", (event) => {
+    updateUiState = reduceUpdateUiState(updateUiState, {
+      type: "progress",
+      payload: event.payload,
+    });
+    renderUpdateDialog();
+  });
+  await listen<UpdateErrorEvent>("update-error", (event) => {
+    updateUiState = reduceUpdateUiState(updateUiState, {
+      type: "failed",
+      payload: event.payload,
+    });
+    renderUpdateDialog();
+  });
+  if (!isPopup) {
+    const pendingUpdate = await api.pendingUpdate().catch(() => null);
+    if (pendingUpdate) await showAvailableUpdate(pendingUpdate);
+  }
 }
 
 async function initMain(): Promise<void> {
@@ -104,7 +139,6 @@ async function initMain(): Promise<void> {
         <button id="open-settings" class="button icon-button" aria-label="${t("action.settings")}">⚙</button>
       </div>
     </header>
-    <div id="update-banner" class="update-banner hidden"></div>
     <main class="workspace">
       <aside class="target-sidebar">
         <div class="sidebar-heading">
@@ -150,6 +184,7 @@ async function initMain(): Promise<void> {
     </main>
     <dialog id="target-dialog" class="modal"></dialog>
     <dialog id="settings-dialog" class="modal settings-modal"></dialog>
+    <dialog id="update-dialog" class="modal update-modal"></dialog>
     <dialog id="range-dialog" class="modal compact-modal">
       <form id="range-form">
         <header><h3>${t("dashboard.customRange")}</h3><button type="button" class="modal-close" aria-label="${t("action.close")}">×</button></header>
@@ -173,7 +208,6 @@ async function initMain(): Promise<void> {
     renderDashboard();
     openTargetDialog();
   }
-  void checkForUpdates();
   window.setInterval(() => {
     if (followLive && dashboard.targets.length > 0) {
       const toMs = Date.now();
@@ -229,6 +263,15 @@ function bindMainEvents(): void {
   });
   root.querySelectorAll<HTMLButtonElement>(".modal-close").forEach((button) => {
     button.addEventListener("click", () => button.closest("dialog")?.close());
+  });
+  byId<HTMLDialogElement>("update-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    if (!isUpdateBusy()) void deferCurrentUpdate();
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (!isUpdateBusy()) return;
+    event.preventDefault();
+    event.returnValue = "";
   });
 }
 
@@ -603,25 +646,128 @@ function schedulePopupHide(): void {
   root.addEventListener("mouseleave", () => schedulePopupHide(), { once: true });
 }
 
-async function checkForUpdates(): Promise<void> {
-  const lastCheck = Number(localStorage.getItem("lnpm-update-check") ?? 0);
-  if (Date.now() - lastCheck < 86_400_000) return;
-  localStorage.setItem("lnpm-update-check", String(Date.now()));
+async function showAvailableUpdate(info: UpdateInfo): Promise<void> {
+  updateUiState = reduceUpdateUiState(updateUiState, { type: "available", payload: info });
+  if (isPopup) return;
+  currentAppVersion ??= await getVersion();
+  renderUpdateDialog();
+  const dialog = byId<HTMLDialogElement>("update-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
+function renderUpdateDialog(): void {
+  if (isPopup || !updateUiState.info) return;
+  const dialog = document.getElementById("update-dialog") as HTMLDialogElement | null;
+  if (!dialog) return;
+  const info = updateUiState.info;
+  const busy = isUpdateBusy();
+  const failure = updateUiState.phase === "failed" ? updateUiState.error : null;
+  const statusKey =
+    updateUiState.phase === "downloading"
+      ? "update.downloading"
+      : updateUiState.phase === "verifying"
+        ? "update.verifying"
+        : updateUiState.phase === "installing"
+          ? "update.installing"
+          : "update.restarting";
+  const progress = updateUiState.percent;
+  const statusContent = busy
+    ? `<div class="update-status" aria-live="polite">
+        <strong>${t(statusKey)}</strong>
+        <progress max="100" ${progress == null ? "" : `value="${progress}"`}></progress>
+        ${
+          updateUiState.phase === "downloading" && progress != null
+            ? `<small>${t("update.downloadProgress", { percent: new Intl.NumberFormat(language, { maximumFractionDigits: 1 }).format(progress) })}</small>`
+            : ""
+        }
+      </div>`
+    : failure
+      ? `<div class="update-error" role="alert">${escapeHtml(formatError(failure))}</div>`
+      : info.notes
+        ? `<section class="update-notes"><strong>${t("update.notes")}</strong><p>${escapeHtml(info.notes)}</p></section>`
+        : "";
+
+  dialog.innerHTML = `
+    <div class="modal-content update-content">
+      <header>
+        <div><span class="eyebrow">LNPM</span><h3>${t("update.title")}</h3></div>
+        ${busy ? "" : `<button id="update-close" type="button" class="modal-close" aria-label="${t("action.close")}">×</button>`}
+      </header>
+      <p class="update-message">${t("update.message", { version: formatVersionLabel(info.version) })}</p>
+      <dl class="update-versions">
+        <div><dt>${t("update.currentVersion")}</dt><dd>${formatVersionLabel(currentAppVersion ?? "0.2.0")}</dd></div>
+        <div><dt>${t("update.newVersion")}</dt><dd>${formatVersionLabel(info.version)}</dd></div>
+      </dl>
+      ${statusContent}
+      <footer>
+        ${
+          busy
+            ? ""
+            : `<button id="update-skip" type="button" class="button ghost danger-text">${t("update.skipVersion")}</button>
+               <div><button id="update-later" type="button" class="button ghost">${t("update.later")}</button><button id="update-install" type="button" class="button primary">${failure ? t("update.retry") : t("update.update")}</button></div>`
+        }
+      </footer>
+    </div>`;
+
+  if (busy) return;
+  dialog.querySelector("#update-close")?.addEventListener("click", () => void deferCurrentUpdate());
+  dialog.querySelector("#update-later")?.addEventListener("click", () => void deferCurrentUpdate());
+  dialog.querySelector("#update-skip")?.addEventListener("click", () => void skipCurrentUpdate());
+  dialog.querySelector("#update-install")?.addEventListener("click", () => void installCurrentUpdate());
+}
+
+async function deferCurrentUpdate(): Promise<void> {
+  const info = updateUiState.info;
+  if (!info || isUpdateBusy()) return;
   try {
-    const response = await fetch("https://api.github.com/repos/xxsLuna/LNPM/releases/latest", {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-    if (!response.ok) return;
-    const release = (await response.json()) as { tag_name: string; html_url: string };
-    const current = await getVersion();
-    if (!isNewerVersion(release.tag_name, current)) return;
-    const banner = byId("update-banner");
-    banner.classList.remove("hidden");
-    banner.innerHTML = `<span>${t("update.available", { version: release.tag_name })}</span><button class="button ghost">${t("action.viewRelease")}</button>`;
-    banner.querySelector("button")?.addEventListener("click", () => void openUrl(release.html_url));
+    settings = await api.deferUpdate(info.version);
+    byId<HTMLDialogElement>("update-dialog").close();
+    updateUiState = reduceUpdateUiState(updateUiState, { type: "dismissed" });
   } catch (error) {
-    console.debug("Update check failed", error);
+    showToast(formatError(error), "error");
   }
+}
+
+async function skipCurrentUpdate(): Promise<void> {
+  const info = updateUiState.info;
+  if (!info || isUpdateBusy()) return;
+  try {
+    settings = await api.skipUpdate(info.version);
+    byId<HTMLDialogElement>("update-dialog").close();
+    updateUiState = reduceUpdateUiState(updateUiState, { type: "dismissed" });
+  } catch (error) {
+    showToast(formatError(error), "error");
+  }
+}
+
+async function installCurrentUpdate(): Promise<void> {
+  const info = updateUiState.info;
+  if (!info || isUpdateBusy()) return;
+  updateUiState = reduceUpdateUiState(updateUiState, {
+    type: "progress",
+    payload: { version: info.version, status: "downloading", percent: 0 },
+  });
+  renderUpdateDialog();
+  try {
+    await api.installUpdate();
+  } catch (error) {
+    const payload = normalizeError(error);
+    updateUiState = reduceUpdateUiState(updateUiState, {
+      type: "failed",
+      payload: { version: info.version, ...payload },
+    });
+    renderUpdateDialog();
+  }
+}
+
+function isUpdateBusy(): boolean {
+  return ["downloading", "verifying", "installing", "restarting"].includes(
+    updateUiState.phase,
+  );
+}
+
+function formatVersionLabel(version: string): string {
+  return version.startsWith("v") ? version : `v${version}`;
 }
 
 function temporaryTarget(): Target {
@@ -699,16 +845,6 @@ function setText(id: string, value: string): void {
 function toLocalInput(timestampMs: number): string {
   const date = new Date(timestampMs - new Date(timestampMs).getTimezoneOffset() * 60_000);
   return date.toISOString().slice(0, 16);
-}
-
-function isNewerVersion(tag: string, current: string): boolean {
-  const next = tag.replace(/^v/, "").split("-")[0].split(".").map(Number);
-  const active = current.split("-")[0].split(".").map(Number);
-  for (let index = 0; index < 3; index += 1) {
-    if ((next[index] ?? 0) > (active[index] ?? 0)) return true;
-    if ((next[index] ?? 0) < (active[index] ?? 0)) return false;
-  }
-  return false;
 }
 
 function escapeHtml(value: string): string {

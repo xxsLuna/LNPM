@@ -86,10 +86,25 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify updater signing secrets
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required"
+          }
+
       - name: Build and publish native packages
         uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: LNPM ${{ github.ref_name }}
@@ -100,10 +115,15 @@ jobs:
             - macOS: Apple Silicon and Intel disk images
             - Linux: AppImage and Debian package
 
-            These initial packages are unsigned. Download assets only from this repository.
+            Updater artifacts are signed and verified by LNPM before installation. Platform code-signing is not yet enabled, so download assets only from this repository.
+
+            LNPM v0.1.0 does not include the updater and cannot update itself. Install v0.2.0 manually once; in-app updates work for releases after v0.2.0.
           releaseDraft: true
           prerelease: false
           generateReleaseNotes: true
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
   finalize:
@@ -117,6 +137,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+
+      - name: Verify installers and updater metadata
+        working-directory: release-assets
+        run: |
+          test -f latest.json
+          test "$(find . -maxdepth 1 -type f -name '*.sig' | wc -l)" -ge 4
+          find . -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' \) | grep -q .
+          find . -maxdepth 1 -type f -name '*.AppImage' | grep -q .
+          find . -maxdepth 1 -type f -name '*.deb' | grep -q .
+          find . -maxdepth 1 -type f -name '*.dmg' | grep -q .
+          jq -e '
+            (.version | type == "string" and length > 0) and
+            (.platforms | type == "object") and
+            ([.platforms[] | select(
+              (.url | type == "string" and length > 0) and
+              (.signature | type == "string" and length > 0)
+            )] | length >= 4)
+          ' latest.json
 
       - name: Generate SHA-256 checksums
         working-directory: release-assets

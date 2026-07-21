@@ -154,7 +154,16 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
                 state.monitor.set_paused(!state.monitor.snapshot().paused);
             }
         }
-        "quit" => app.exit(0),
+        "quit" => {
+            if app
+                .try_state::<crate::updater::UpdateManager>()
+                .is_some_and(|manager| manager.is_installing())
+            {
+                show_main_window(app);
+            } else {
+                app.exit(0);
+            }
+        }
         _ => {}
     }
 }
@@ -177,6 +186,15 @@ pub fn handle_tray_event(app: &AppHandle, event: &TrayIconEvent) {
 
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     match event {
+        WindowEvent::CloseRequested { api, .. }
+            if window.label() == "main"
+                && window
+                    .app_handle()
+                    .try_state::<crate::updater::UpdateManager>()
+                    .is_some_and(|manager| manager.is_installing()) =>
+        {
+            api.prevent_close();
+        }
         WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
             api.prevent_close();
             let _ = window.hide();

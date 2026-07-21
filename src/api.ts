@@ -6,6 +6,7 @@ import type {
   PingSample,
   StorageInfo,
   Target,
+  UpdateInfo,
 } from "./types";
 
 export const api = {
@@ -38,4 +39,10 @@ export const api = {
   showMain: () => invoke<void>("show_main"),
   hidePopup: () => invoke<void>("hide_popup"),
   quit: () => invoke<void>("quit_app"),
+  pendingUpdate: () => invoke<UpdateInfo | null>("get_pending_update"),
+  deferUpdate: (version: string) =>
+    invoke<AppSettings>("defer_update", { version }),
+  skipUpdate: (version: string) =>
+    invoke<AppSettings>("skip_update", { version }),
+  installUpdate: () => invoke<void>("install_update"),
 };

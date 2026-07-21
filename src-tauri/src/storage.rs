@@ -721,6 +721,7 @@ mod tests {
             start_at_login: true,
             language: crate::domain::LanguagePreference::Ko,
             first_run: false,
+            ..AppSettings::default()
         };
         database.save_settings(&settings).unwrap();
         assert_eq!(database.load_settings().unwrap(), settings);

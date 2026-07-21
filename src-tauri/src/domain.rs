@@ -361,6 +361,12 @@ pub struct AppSettings {
     pub start_at_login: bool,
     pub language: LanguagePreference,
     pub first_run: bool,
+    #[serde(default)]
+    pub update_deferred_version: Option<String>,
+    #[serde(default)]
+    pub update_deferred_until_ms: Option<i64>,
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -371,6 +377,9 @@ impl Default for AppSettings {
             start_at_login: false,
             language: LanguagePreference::Auto,
             first_run: true,
+            update_deferred_version: None,
+            update_deferred_until_ms: None,
+            skipped_update_version: None,
         }
     }
 }
@@ -418,5 +427,24 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn deserializes_settings_saved_before_updater_preferences() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "retentionDays": 30,
+                "notificationsEnabled": true,
+                "startAtLogin": false,
+                "language": "ko",
+                "firstRun": false
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.language, LanguagePreference::Ko);
+        assert_eq!(settings.update_deferred_version, None);
+        assert_eq!(settings.update_deferred_until_ms, None);
+        assert_eq!(settings.skipped_update_version, None);
     }
 }

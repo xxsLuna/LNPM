@@ -34,6 +34,12 @@ const errorKeys: Record<string, MessageKey> = {
   invalidData: "error.invalidData",
   autostart: "error.autostart",
   monitoring: "error.monitoring",
+  updateCheck: "error.updateCheck",
+  updateDownload: "error.updateDownload",
+  updateInstall: "error.updateInstall",
+  updateSignature: "error.updateSignature",
+  updateBusy: "error.updateBusy",
+  updateMissing: "error.updateMissing",
 };
 
 let activeLanguage: Language = "en";
@@ -178,7 +184,7 @@ function formatNumber(value: number, language: Language, maximumFractionDigits: 
   return new Intl.NumberFormat(language, { maximumFractionDigits }).format(value);
 }
 
-function normalizeError(error: unknown): UserErrorPayload {
+export function normalizeError(error: unknown): UserErrorPayload {
   if (isErrorPayload(error)) return error;
   if (error instanceof Error) return { code: "unknown", detail: error.message };
   if (typeof error === "string") {

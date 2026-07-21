@@ -22,7 +22,7 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    fn new(code: impl Into<String>, detail: impl ToString) -> Self {
+    pub(crate) fn new(code: impl Into<String>, detail: impl ToString) -> Self {
         Self {
             code: code.into(),
             detail: Some(detail.to_string()),
@@ -182,6 +182,16 @@ pub fn hide_popup(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn quit_app(app: AppHandle) {
+pub fn quit_app(app: AppHandle) -> Result<(), CommandError> {
+    if app
+        .try_state::<crate::updater::UpdateManager>()
+        .is_some_and(|manager| manager.is_installing())
+    {
+        return Err(CommandError::new(
+            "updateBusy",
+            "an update is currently being installed",
+        ));
+    }
     app.exit(0);
+    Ok(())
 }

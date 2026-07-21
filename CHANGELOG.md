@@ -10,12 +10,17 @@ All notable changes to LNPM are documented in this file.
 - Locale-aware system language detection, date and number formatting, and instant language switching across all application windows.
 - Localized README editions with a centered product hero, language selector, badges, and dashboard screenshot.
 - A new cat-ear wireless-signal logo and matching native application icons.
+- Signed in-app updates powered by the official Tauri Updater, with startup and 30-minute checks, progress reporting, 24-hour deferral, version skipping, and retryable failures.
 
 ### Changed
 
 - Tauri command and monitor errors now use stable error codes with optional diagnostic details.
 - Chart tooltips now stay beside the pointer and flip at chart edges instead of drifting away from the hovered value.
 - CI now verifies frontend localization tests alongside the cross-platform TypeScript and Rust checks.
+
+### Upgrade note
+
+- LNPM v0.1.0 does not include the updater and cannot update itself. Install v0.2.0 manually once; in-app updates apply to releases after v0.2.0.
 
 ## 0.1.0 - 2026-07-20
 
