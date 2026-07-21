@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/lnpm-logo.png" alt="LNPM logo" width="112" />
+  <img src="docs/assets/lnpm-logo.svg" alt="LNPM logo" width="112" />
   <h1>Live Network Ping Monitor</h1>
   <p>A native tray app for understanding latency, packet loss, and network stability in real time.</p>
   <p>
@@ -92,9 +92,13 @@ Docker can run some frontend and Rust checks, but it cannot reliably test the na
 
 ## Release process
 
-Every push and pull request is verified by the cross-platform CI workflow. A version tag such as `v0.2.0` starts the release workflow. The release becomes public only after every platform build succeeds and the workflow verifies the installers, updater signatures, and consolidated `latest.json`.
+Every push and pull request is verified by the cross-platform CI workflow. A version tag such as `v0.2.1` starts the release workflow. The release becomes public only after every platform build succeeds and the workflow verifies the installers, updater signatures, and consolidated `latest.json`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+## Project administrator
+
+LNPM is maintained and administered by [@xxsLuna](https://github.com/xxsLuna).
 
 ## License
 

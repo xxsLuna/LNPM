@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title" shape-rendering="geometricPrecision">
+  <title id="title">LNPM cat-ear wireless signal</title>
+  <g fill="none" stroke="#17d4c4" stroke-linecap="round" stroke-linejoin="round" stroke-width="4">
+    <path d="M7 23 9 8l10 8" />
+    <path d="m29 16 10-8 2 15" />
+    <path d="M7 23c9-10 25-10 34 0" />
+    <path d="M14 32c5-6 15-6 20 0" />
+  </g>
+  <circle cx="24" cy="39" r="3" fill="#17d4c4" />
+</svg>

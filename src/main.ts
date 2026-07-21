@@ -4,6 +4,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 
 import { api } from "./api";
 import { LatencyChart } from "./chart";
+import { aggregateRangeSummary } from "./dashboard-selection";
 import {
   formatBytes,
   formatDuration,
@@ -43,7 +44,7 @@ import "./styles.css";
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("LNPM root element is missing");
 const root: HTMLDivElement = rootElement;
-const logoUrl = new URL("../docs/assets/lnpm-logo.png", import.meta.url).href;
+const logoUrl = new URL("../docs/assets/lnpm-logo.svg", import.meta.url).href;
 
 const isPopup = new URLSearchParams(location.search).get("view") === "popup";
 let settings: AppSettings = {
@@ -175,7 +176,7 @@ async function initMain(): Promise<void> {
         </div>
         <div class="summary-grid">
           <article class="metric-card"><span>${t("dashboard.average")}</span><strong id="metric-average">—</strong></article>
-          <article class="metric-card"><span>${t("dashboard.p95Latency")}</span><strong id="metric-p95">—</strong></article>
+          <article class="metric-card"><span id="metric-p95-label">${t("dashboard.p95Latency")}</span><strong id="metric-p95">—</strong></article>
           <article class="metric-card warning"><span>${t("dashboard.unstable")}</span><strong id="metric-unstable">—</strong><small id="metric-unstable-time"></small></article>
           <article class="metric-card danger"><span>${t("dashboard.disconnected")}</span><strong id="metric-disconnected">—</strong><small id="metric-disconnected-time"></small></article>
           <article class="metric-card"><span>${t("dashboard.packetLoss")}</span><strong id="metric-loss">—</strong></article>
@@ -199,8 +200,11 @@ async function initMain(): Promise<void> {
   bindMainEvents();
   restoreViewState();
   if (dashboard.targets.length > 0) {
-    if (!dashboard.targets.some((item) => item.target.id === selectedTargetId)) {
-      selectedTargetId = dashboard.targets[0].target.id;
+    if (
+      selectedTargetId !== null &&
+      !dashboard.targets.some((item) => item.target.id === selectedTargetId)
+    ) {
+      selectedTargetId = null;
     }
     renderDashboard();
     await loadHistory(currentRange.fromMs, currentRange.toMs);
@@ -280,26 +284,33 @@ function renderDashboard(): void {
   byId("target-count").textContent = String(dashboard.targets.length);
   byId("empty-targets").classList.toggle("hidden", dashboard.targets.length > 0);
   byId("target-list").classList.toggle("hidden", dashboard.targets.length === 0);
-  byId("pause-monitoring").textContent = dashboard.paused
-    ? `▶ ${t("action.resume")}`
-    : `Ⅱ ${t("action.pause")}`;
+  const pauseButton = byId<HTMLButtonElement>("pause-monitoring");
+  const pauseLabel = dashboard.paused ? t("action.resume") : t("action.pause");
+  pauseButton.innerHTML = buttonLabel(dashboard.paused ? "play" : "pause", pauseLabel);
+  pauseButton.setAttribute("aria-label", pauseLabel);
 
   if (selectedTargetId && !dashboard.targets.some((item) => item.target.id === selectedTargetId)) {
-    selectedTargetId = dashboard.targets[0]?.target.id ?? null;
+    selectedTargetId = null;
   }
   const targetList = byId("target-list");
-  targetList.innerHTML = dashboard.targets
-    .map((item) => {
-      const latency = item.latestSample?.latencyMs;
-      return `<button class="target-row ${item.target.id === selectedTargetId ? "selected" : ""}" data-target-id="${item.target.id}">
-        <span class="status-dot state-${item.state}"></span>
-        <span class="target-copy"><strong>${escapeHtml(item.target.name)}</strong><small>${escapeHtml(item.target.host)}</small></span>
-        <span class="target-latency">${formatLatency(latency)}</span>
-        <span class="target-menu" data-edit-target="${item.target.id}" role="button" aria-label="${t("action.manageTarget")}">${t("action.manage")}</span>
-      </button>`;
-    })
-    .join("");
-  targetList.querySelectorAll<HTMLButtonElement>(".target-row").forEach((row) => {
+  const allRow = `<button class="target-row all-target-row ${selectedTargetId === null ? "selected" : ""}" data-select-all="true">
+    <span class="all-target-icon" aria-hidden="true">${iconSvg("layers")}</span>
+    <strong>${t("dashboard.allMonitors")}</strong>
+  </button>`;
+  targetList.innerHTML =
+    allRow +
+    dashboard.targets
+      .map((item) => {
+        const latency = item.latestSample?.latencyMs;
+        return `<div class="target-row ${item.target.id === selectedTargetId ? "selected" : ""}" data-target-id="${item.target.id}" role="button" tabindex="0">
+          <span class="status-dot state-${item.state}"></span>
+          <span class="target-copy"><strong>${escapeHtml(item.target.name)}</strong><small>${escapeHtml(item.target.host)}</small></span>
+          <span class="target-latency">${formatLatency(latency)}</span>
+          <button type="button" class="target-menu" data-edit-target="${item.target.id}" title="${escapeHtml(t("action.manageTarget"))}" aria-label="${escapeHtml(t("action.manageTarget"))}">${iconSvg("edit")}</button>
+        </div>`;
+      })
+      .join("");
+  targetList.querySelectorAll<HTMLElement>(".target-row").forEach((row) => {
     row.addEventListener("click", (event) => {
       const targetId = row.dataset.targetId ?? null;
       if ((event.target as HTMLElement).closest("[data-edit-target]")) {
@@ -312,11 +323,23 @@ function renderDashboard(): void {
       if (history) chart?.render(history, selectedTargetId);
       renderSummary();
     });
+    row.addEventListener("keydown", (event) => {
+      if (row instanceof HTMLButtonElement) return;
+      if ((event.target as HTMLElement).closest("[data-edit-target]")) return;
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      row.click();
+    });
   });
 
   const selected = selectedStatus();
-  byId("selected-name").textContent = selected?.target.name ?? t("dashboard.overview");
-  byId("selected-host").textContent = selected?.target.host ?? "—";
+  const viewingAll = selectedTargetId === null;
+  byId("selected-name").textContent = viewingAll
+    ? t("dashboard.allMonitors")
+    : (selected?.target.name ?? t("dashboard.overview"));
+  const selectedHost = byId("selected-host");
+  selectedHost.textContent = viewingAll ? "\u00a0" : (selected?.target.host ?? "—");
+  selectedHost.classList.toggle("layout-placeholder", viewingAll);
   const statePill = byId("selected-state");
   const state = selected?.state ?? aggregateState();
   statePill.className = `state-pill state-${state}`;
@@ -359,12 +382,23 @@ async function loadHistory(fromMs: number, toMs: number, showLoading = true): Pr
 
 function renderLegend(): void {
   if (!history) return;
-  byId("chart-legend").innerHTML = history.series
-    .map(
-      (series, index) =>
-        `<button data-legend-id="${series.target.id}" class="legend-item ${series.target.id === selectedTargetId ? "selected" : ""}"><span style="--series-color:${["#5eead4", "#60a5fa", "#c084fc", "#f472b6", "#facc15"][index % 5]}"></span>${escapeHtml(series.target.name)}</button>`,
-    )
-    .join("");
+  const allLegend = `<button data-legend-all="true" class="legend-item all-legend ${selectedTargetId === null ? "selected" : ""}"><span class="legend-all-swatch" aria-hidden="true"></span>${t("dashboard.all")}</button>`;
+  byId("chart-legend").innerHTML =
+    allLegend +
+    history.series
+      .map(
+        (series, index) =>
+          `<button data-legend-id="${series.target.id}" class="legend-item ${series.target.id === selectedTargetId ? "selected" : ""}"><span style="--series-color:${["#5eead4", "#60a5fa", "#c084fc", "#f472b6", "#facc15"][index % 5]}"></span>${escapeHtml(series.target.name)}</button>`,
+      )
+      .join("");
+  byId("chart-legend")
+    .querySelector<HTMLButtonElement>("[data-legend-all]")
+    ?.addEventListener("click", () => {
+      selectedTargetId = null;
+      renderDashboard();
+      chart?.render(history!, selectedTargetId);
+      renderLegend();
+    });
   byId("chart-legend").querySelectorAll<HTMLButtonElement>("[data-legend-id]").forEach((button) => {
     button.addEventListener("click", () => {
       selectedTargetId = button.dataset.legendId ?? null;
@@ -376,7 +410,14 @@ function renderLegend(): void {
 }
 
 function renderSummary(): void {
-  const summary = history?.series.find((series) => series.target.id === selectedTargetId)?.summary;
+  const summary =
+    selectedTargetId === null
+      ? aggregateRangeSummary(history?.series ?? [])
+      : history?.series.find((series) => series.target.id === selectedTargetId)?.summary;
+  setText(
+    "metric-p95-label",
+    selectedTargetId === null ? t("dashboard.worstP95Latency") : t("dashboard.p95Latency"),
+  );
   setText("metric-average", formatLatency(summary?.averageLatencyMs));
   setText("metric-p95", formatLatency(summary?.p95LatencyMs));
   setText("metric-unstable", formatPercent(summary?.unstablePercent));
@@ -495,7 +536,7 @@ async function removeTarget(target: Target, dialog: HTMLDialogElement): Promise<
     await api.archiveTarget(target.id);
     dialog.close();
     dashboard = await api.dashboard();
-    selectedTargetId = dashboard.targets[0]?.target.id ?? null;
+    selectedTargetId = null;
     renderDashboard();
     if (selectedTargetId) await loadHistory(currentRange.fromMs, currentRange.toMs);
     else {
@@ -598,9 +639,10 @@ function renderPopupStatus(): void {
   const overallElement = byId("popup-overall");
   overallElement.className = `state-text state-${overall}`;
   overallElement.textContent = stateLabel(overall, language);
-  byId("popup-pause").textContent = dashboard.paused
-    ? t("action.resume")
-    : t("action.pause");
+  const popupPause = byId<HTMLButtonElement>("popup-pause");
+  const popupPauseLabel = dashboard.paused ? t("action.resume") : t("action.pause");
+  popupPause.innerHTML = buttonLabel(dashboard.paused ? "play" : "pause", popupPauseLabel);
+  popupPause.setAttribute("aria-label", popupPauseLabel);
   byId("popup-targets").innerHTML = dashboard.targets.length
     ? dashboard.targets
         .map(
@@ -858,6 +900,21 @@ function escapeHtml(value: string): string {
     };
     return entities[character];
   });
+}
+
+function buttonLabel(icon: "pause" | "play", label: string): string {
+  return `<span class="button-label">${iconSvg(icon)}<span>${escapeHtml(label)}</span></span>`;
+}
+
+function iconSvg(icon: "pause" | "play" | "edit" | "layers"): string {
+  const paths = {
+    pause: '<path d="M8 6v12M16 6v12" />',
+    play: '<path d="m9 6 9 6-9 6Z" />',
+    edit: '<path d="M5 19h4l10-10-4-4L5 15v4Z" /><path d="m13.5 6.5 4 4" />',
+    layers:
+      '<path d="m12 4 8 4-8 4-8-4 8-4Z" /><path d="m4 12 8 4 8-4" /><path d="m4 16 8 4 8-4" />',
+  } as const;
+  return `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[icon]}</svg>`;
 }
 
 const viewStateKey = "lnpm-view-state";

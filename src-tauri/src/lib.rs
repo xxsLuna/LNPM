@@ -99,9 +99,11 @@ pub fn run() {
             updater::install_update,
         ]);
 
-    let app = builder
-        .build(tauri::generate_context!())
-        .expect("error while building LNPM");
+    let mut context = tauri::generate_context!();
+    context.set_default_window_icon(Some(
+        tauri::include_image!("./icons/128x128.png").to_owned(),
+    ));
+    let app = builder.build(context).expect("error while building LNPM");
     app.run(|app, event| {
         if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. })
             && let Some(state) = app.try_state::<AppState>()

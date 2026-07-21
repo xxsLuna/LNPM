@@ -111,6 +111,14 @@ jobs:
           releaseBody: |
             Native installers for Live Network Ping Monitor.
 
+            Highlights in v0.2.1:
+
+            - Adds an explicit all-monitors view with combined metrics and equal chart emphasis
+            - Polishes the dashboard, compact popup, chart tooltip and date-axis layout
+            - Uses the cat-ear wireless logo across the app, native packages and status-aware tray icon
+            - Groups simultaneous network-quality changes into a single native notification
+            - Identifies [@xxsLuna](https://github.com/xxsLuna) as the project administrator
+
             - Windows: NSIS executable and MSI installer
             - macOS: Apple Silicon and Intel disk images
             - Linux: AppImage and Debian package
@@ -118,9 +126,13 @@ jobs:
             Updater artifacts are signed and verified by LNPM before installation. Platform code-signing is not yet enabled, so download assets only from this repository.
 
             LNPM v0.1.0 does not include the updater and cannot update itself. Install v0.2.0 manually once; in-app updates work for releases after v0.2.0.
+
+            LNPM v0.2.0 and later can install this release through the in-app updater.
+
+            Project administrator: [@xxsLuna](https://github.com/xxsLuna)
           releaseDraft: true
           prerelease: false
-          generateReleaseNotes: true
+          generateReleaseNotes: false
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true

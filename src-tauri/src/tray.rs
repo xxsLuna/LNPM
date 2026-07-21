@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tauri::{
@@ -20,11 +24,43 @@ use crate::{
 };
 
 const TRAY_ID: &str = "lnpm-tray";
+const NOTIFICATION_BATCH_WINDOW: Duration = Duration::from_millis(2_500);
+static TRAY_ICON_SOURCE: OnceLock<(Vec<u8>, u32, u32)> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct PendingNotification {
+    target_name: String,
+    state: QualityState,
+}
+
+#[derive(Default)]
+struct PendingNotificationBatch {
+    scheduled: bool,
+    transitions: HashMap<String, PendingNotification>,
+}
+
+impl PendingNotificationBatch {
+    fn replace(&mut self, event: &QualityTransitionEvent) {
+        self.transitions.insert(
+            event.target.id.clone(),
+            PendingNotification {
+                target_name: event.target.name.clone(),
+                state: event.transition.to,
+            },
+        );
+    }
+
+    fn drain(&mut self) -> Vec<PendingNotification> {
+        self.scheduled = false;
+        self.transitions.drain().map(|(_, event)| event).collect()
+    }
+}
 
 pub struct TauriEventSink {
     app: AppHandle,
     database: Database,
     last_notifications: Mutex<HashMap<(String, QualityState), i64>>,
+    pending_notifications: Arc<Mutex<PendingNotificationBatch>>,
 }
 
 impl TauriEventSink {
@@ -33,10 +69,11 @@ impl TauriEventSink {
             app,
             database,
             last_notifications: Mutex::new(HashMap::new()),
+            pending_notifications: Arc::new(Mutex::new(PendingNotificationBatch::default())),
         })
     }
 
-    fn notify_transition(&self, event: &QualityTransitionEvent) {
+    fn queue_notification(&self, event: &QualityTransitionEvent) {
         let Ok(settings) = self.database.load_settings() else {
             return;
         };
@@ -60,21 +97,32 @@ impl TauriEventSink {
         notifications.insert(key, now_ms);
         drop(notifications);
 
-        let language = active_language(settings.language);
-        let key = match event.transition.to {
-            QualityState::Unstable => "notification.unstable",
-            QualityState::Disconnected => "notification.disconnected",
-            QualityState::Stable => "notification.recovered",
-            _ => return,
-        };
-        let body = message(language, key, &[("name", &event.target.name)]);
-        let _ = self
-            .app
-            .notification()
-            .builder()
-            .title("LNPM")
-            .body(body)
-            .show();
+        let mut pending = self.pending_notifications.lock();
+        pending.replace(event);
+        if pending.scheduled {
+            return;
+        }
+        pending.scheduled = true;
+        drop(pending);
+
+        let app = self.app.clone();
+        let database = self.database.clone();
+        let pending = Arc::clone(&self.pending_notifications);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(NOTIFICATION_BATCH_WINDOW).await;
+            let transitions = pending.lock().drain();
+            if transitions.is_empty() {
+                return;
+            }
+            let Ok(settings) = database.load_settings() else {
+                return;
+            };
+            if !settings.notifications_enabled {
+                return;
+            }
+            let body = notification_body(active_language(settings.language), &transitions);
+            let _ = app.notification().builder().title("LNPM").body(body).show();
+        });
     }
 }
 
@@ -88,7 +136,7 @@ impl MonitorEventSink for TauriEventSink {
 
     fn quality_transition(&self, event: QualityTransitionEvent) {
         let _ = self.app.emit("quality-transition", &event);
-        self.notify_transition(&event);
+        self.queue_notification(&event);
     }
 
     fn monitor_error(&self, target_id: Option<&str>, code: &str, detail: &str) {
@@ -97,6 +145,47 @@ impl MonitorEventSink for TauriEventSink {
             serde_json::json!({ "targetId": target_id, "code": code, "detail": detail }),
         );
     }
+}
+
+fn notification_body(language: Language, transitions: &[PendingNotification]) -> String {
+    if let [transition] = transitions {
+        let key = match transition.state {
+            QualityState::Unstable => "notification.unstable",
+            QualityState::Disconnected => "notification.disconnected",
+            QualityState::Stable => "notification.recovered",
+            _ => return String::new(),
+        };
+        return message(language, key, &[("name", &transition.target_name)]);
+    }
+
+    let mut groups = Vec::new();
+    for state in [
+        QualityState::Disconnected,
+        QualityState::Unstable,
+        QualityState::Stable,
+    ] {
+        let mut names = transitions
+            .iter()
+            .filter(|transition| transition.state == state)
+            .map(|transition| transition.target_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_by_key(|name| name.to_lowercase());
+        if !names.is_empty() {
+            groups.push(format!(
+                "{} ({}): {}",
+                state_label(language, state),
+                names.len(),
+                names.join(", ")
+            ));
+        }
+    }
+    let count = transitions.len().to_string();
+    let items = groups.join("\n");
+    message(
+        language,
+        "notification.multiple",
+        &[("count", &count), ("items", &items)],
+    )
 }
 
 pub fn build_tray<R: Runtime>(app: &App<R>, settings: &AppSettings) -> tauri::Result<()> {
@@ -278,52 +367,30 @@ fn severity(state: QualityState) -> u8 {
 }
 
 fn status_icon(state: QualityState) -> Image<'static> {
-    let color = match state {
-        QualityState::Stable => [40, 199, 111, 255],
-        QualityState::Unstable => [245, 158, 11, 255],
-        QualityState::Disconnected | QualityState::Error => [239, 68, 68, 255],
-        _ => [107, 114, 128, 255],
-    };
-    let mut rgba = vec![0_u8; 32 * 32 * 4];
-    for y in 0..32_i32 {
-        for x in 0..32_i32 {
-            let distance = (x - 16) * (x - 16) + (y - 16) * (y - 16);
-            if distance <= 14 * 14 {
-                put_pixel(&mut rgba, x, y, color);
-            }
+    let (source, width, height) = TRAY_ICON_SOURCE.get_or_init(|| {
+        let image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
+            .expect("embedded tray icon must be valid PNG");
+        (image.rgba().to_vec(), image.width(), image.height())
+    });
+    let color = tray_icon_color(state);
+    let mut rgba = source.clone();
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] > 0 {
+            pixel[..3].copy_from_slice(&color);
         }
     }
-    let wave = [
-        (5, 17),
-        (9, 17),
-        (12, 12),
-        (15, 21),
-        (19, 9),
-        (22, 17),
-        (27, 17),
-    ];
-    for segment in wave.windows(2) {
-        draw_line(&mut rgba, segment[0], segment[1], [255, 255, 255, 255]);
-    }
-    Image::new_owned(rgba, 32, 32)
+    Image::new_owned(rgba, *width, *height)
 }
 
-fn draw_line(rgba: &mut [u8], from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
-    let steps = (to.0 - from.0).abs().max((to.1 - from.1).abs()).max(1);
-    for step in 0..=steps {
-        let x = from.0 + (to.0 - from.0) * step / steps;
-        let y = from.1 + (to.1 - from.1) * step / steps;
-        put_pixel(rgba, x, y, color);
-        put_pixel(rgba, x, y + 1, color);
+fn tray_icon_color(state: QualityState) -> [u8; 3] {
+    match state {
+        QualityState::Stable => [23, 212, 196],
+        QualityState::Unstable => [245, 158, 11],
+        QualityState::Disconnected | QualityState::Error => [148, 163, 184],
+        QualityState::Paused | QualityState::WarmingUp | QualityState::Unobserved => {
+            [100, 116, 139]
+        }
     }
-}
-
-fn put_pixel(rgba: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
-    if !(0..32).contains(&x) || !(0..32).contains(&y) {
-        return;
-    }
-    let index = (y as usize * 32 + x as usize) * 4;
-    rgba[index..index + 4].copy_from_slice(&color);
 }
 
 #[allow(dead_code)]
@@ -333,4 +400,77 @@ fn _transition_is_recovery(transition: &StateTransition) -> bool {
             transition.from,
             QualityState::Unstable | QualityState::Disconnected
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_one_transition_with_the_existing_specific_message() {
+        let transitions = vec![PendingNotification {
+            target_name: "Google".into(),
+            state: QualityState::Unstable,
+        }];
+
+        assert_eq!(
+            notification_body(Language::En, &transitions),
+            "Google network quality is unstable"
+        );
+    }
+
+    #[test]
+    fn groups_multiple_transitions_into_one_localized_message() {
+        let transitions = vec![
+            PendingNotification {
+                target_name: "Office".into(),
+                state: QualityState::Unstable,
+            },
+            PendingNotification {
+                target_name: "Google".into(),
+                state: QualityState::Unstable,
+            },
+            PendingNotification {
+                target_name: "Gateway".into(),
+                state: QualityState::Disconnected,
+            },
+        ];
+
+        assert_eq!(
+            notification_body(Language::En, &transitions),
+            "3 network status changes\nDisconnected (1): Gateway\nUnstable (2): Google, Office"
+        );
+    }
+
+    #[test]
+    fn keeps_the_brand_silhouette_and_tints_it_for_each_tray_state() {
+        let stable = status_icon(QualityState::Stable);
+        let unstable = status_icon(QualityState::Unstable);
+        let disconnected = status_icon(QualityState::Disconnected);
+
+        assert_eq!((stable.width(), stable.height()), (32, 32));
+        assert_eq!(
+            stable
+                .rgba()
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>(),
+            unstable
+                .rgba()
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            stable.rgba().chunks_exact(4).any(|pixel| {
+                pixel[3] > 0 && pixel[..3] == tray_icon_color(QualityState::Stable)
+            })
+        );
+        assert!(unstable.rgba().chunks_exact(4).any(|pixel| {
+            pixel[3] > 0 && pixel[..3] == tray_icon_color(QualityState::Unstable)
+        }));
+        assert!(disconnected.rgba().chunks_exact(4).any(|pixel| {
+            pixel[3] > 0 && pixel[..3] == tray_icon_color(QualityState::Disconnected)
+        }));
+    }
 }

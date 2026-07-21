@@ -1,9 +1,10 @@
 {
   "name": "lnpm",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packageManager": "pnpm@11.9.0",
   "description": "Cross-platform live ICMP latency and network stability monitor",
+  "author": "xxsLuna",
   "license": "MIT",
   "type": "module",
   "scripts": {

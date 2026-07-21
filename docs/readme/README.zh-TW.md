@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="../assets/lnpm-logo.png" alt="LNPM 標誌" width="112" />
+  <img src="../assets/lnpm-logo.svg" alt="LNPM 標誌" width="112" />
   <h1>Live Network Ping Monitor</h1>
   <p>用於即時掌握延遲、封包遺失與網路穩定性的原生系統匣應用程式。</p>
   <p>
@@ -92,9 +92,13 @@ Docker 可以執行部分前端與 Rust 檢查，但無法可靠測試原生系�
 
 ## 發佈流程
 
-每次 push 與 pull request 都會經過跨平台 CI 工作流程驗證。建立 `v0.2.0` 之類的版本標籤後會啟動發佈工作流程。只有所有平台建置成功，並完成安裝檔、updater 簽章和整合 `latest.json` 驗證後，版本才會公開發佈。
+每次 push 與 pull request 都會經過跨平台 CI 工作流程驗證。建立 `v0.2.1` 之類的版本標籤後會啟動發佈工作流程。只有所有平台建置成功，並完成安裝檔、updater 簽章和整合 `latest.json` 驗證後，版本才會公開發佈。
 
 貢獻指南請參閱 [CONTRIBUTING.md](../../CONTRIBUTING.md)，安全性漏洞回報請參閱 [SECURITY.md](../../SECURITY.md)。
+
+## 專案管理員
+
+LNPM 由專案管理員 [@xxsLuna](https://github.com/xxsLuna) 維護與管理。
 
 ## 授權條款
 

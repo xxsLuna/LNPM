@@ -2,6 +2,27 @@
 
 All notable changes to LNPM are documented in this file.
 
+## 0.2.1 - 2026-07-21
+
+### Added
+
+- An explicit all-monitors selection with combined live latency, monitor-time metrics, and equal chart emphasis.
+
+### Changed
+
+- The application and native icon set now use a pixel-aligned, symmetric cat-ear wireless mark.
+- The all-monitors selector now uses a compact single-line layout that keeps localized labels readable.
+- The tray keeps the cat-ear wireless mark and tints it teal, orange, or gray to reflect live network health.
+- Native quality alerts are grouped into a single notification when several monitors change state together.
+- Project metadata identifies `xxsLuna` as the project administrator and disables generated contributor sections in future release notes.
+
+### Fixed
+
+- Replaced text-like pause and resume glyphs with proper interface icons.
+- Kept monitor management controls inside the sidebar without horizontal scrolling.
+- Removed the redundant inner frame from the compact tray popup.
+- Explicitly embeds the LNPM window icon for Windows title-bar and taskbar use.
+
 ## 0.2.0 - 2026-07-21
 
 ### Added

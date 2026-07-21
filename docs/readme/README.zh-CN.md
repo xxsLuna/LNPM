@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="../assets/lnpm-logo.png" alt="LNPM 标志" width="112" />
+  <img src="../assets/lnpm-logo.svg" alt="LNPM 标志" width="112" />
   <h1>Live Network Ping Monitor</h1>
   <p>用于实时了解延迟、丢包和网络稳定性的原生托盘应用。</p>
   <p>
@@ -92,9 +92,13 @@ Docker 可以运行部分前端和 Rust 检查，但无法可靠测试原生托�
 
 ## 发布流程
 
-每次 push 和 pull request 都会通过跨平台 CI 工作流验证。创建 `v0.2.0` 之类的版本标签后会启动发布工作流。只有所有平台构建成功，并完成安装包、updater 签名和统一 `latest.json` 验证后，版本才会公开发布。
+每次 push 和 pull request 都会通过跨平台 CI 工作流验证。创建 `v0.2.1` 之类的版本标签后会启动发布工作流。只有所有平台构建成功，并完成安装包、updater 签名和统一 `latest.json` 验证后，版本才会公开发布。
 
 有关贡献指南，请参阅 [CONTRIBUTING.md](../../CONTRIBUTING.md)；有关安全漏洞报告，请参阅 [SECURITY.md](../../SECURITY.md)。
+
+## 项目管理员
+
+LNPM 由项目管理员 [@xxsLuna](https://github.com/xxsLuna) 维护和管理。
 
 ## 许可证
 

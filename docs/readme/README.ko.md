@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="../assets/lnpm-logo.png" alt="LNPM 로고" width="112" />
+  <img src="../assets/lnpm-logo.svg" alt="LNPM 로고" width="112" />
   <h1>Live Network Ping Monitor</h1>
   <p>지연 시간, 패킷 손실, 네트워크 안정성을 실시간으로 파악하는 네이티브 트레이 앱입니다.</p>
   <p>
@@ -92,9 +92,13 @@ Docker로 일부 프런트엔드 및 Rust 검사를 실행할 수 있지만 네�
 
 ## 릴리스 절차
 
-모든 push와 pull request는 크로스 플랫폼 CI 워크플로로 검증됩니다. `v0.2.0`과 같은 버전 태그를 만들면 릴리스 워크플로가 시작됩니다. 모든 플랫폼 빌드가 성공하고 설치 파일, updater 서명, 통합 `latest.json` 검증이 끝난 뒤에만 릴리스가 공개됩니다.
+모든 push와 pull request는 크로스 플랫폼 CI 워크플로로 검증됩니다. `v0.2.1`과 같은 버전 태그를 만들면 릴리스 워크플로가 시작됩니다. 모든 플랫폼 빌드가 성공하고 설치 파일, updater 서명, 통합 `latest.json` 검증이 끝난 뒤에만 릴리스가 공개됩니다.
 
 기여 방법은 [CONTRIBUTING.md](../../CONTRIBUTING.md), 보안 취약점 신고 방법은 [SECURITY.md](../../SECURITY.md)를 참고하세요.
+
+## 프로젝트 관리자
+
+LNPM은 프로젝트 관리자 [@xxsLuna](https://github.com/xxsLuna)가 유지·관리합니다.
 
 ## 라이선스
 

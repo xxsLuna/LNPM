@@ -122,6 +122,9 @@ export class LatencyChart {
     if (this.options.compact) {
       return history.series.flatMap((series) => series.intervals);
     }
+    if (this.selectedTargetId === null) {
+      return history.series.flatMap((series) => series.intervals);
+    }
     const selected =
       history.series.find((series) => series.target.id === this.selectedTargetId) ??
       history.series[0];
