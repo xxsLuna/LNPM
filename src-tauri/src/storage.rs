@@ -160,7 +160,9 @@ impl Database {
     }
 
     pub fn save_target(&self, target: &Target) -> StorageResult<()> {
-        target.validate().map_err(StorageError::InvalidData)?;
+        target
+            .validate()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         let connection = self.open()?;
         connection.execute(
             "INSERT INTO targets (
@@ -717,7 +719,7 @@ mod tests {
             retention_days: Some(90),
             notifications_enabled: false,
             start_at_login: true,
-            language: "ko".into(),
+            language: crate::domain::LanguagePreference::Ko,
             first_run: false,
         };
         database.save_settings(&settings).unwrap();

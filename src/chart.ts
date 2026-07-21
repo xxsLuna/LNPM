@@ -1,7 +1,7 @@
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
-import { formatLatency } from "./i18n";
+import { formatDateTime, formatLatency, stateLabel } from "./i18n";
 import type { HistoryResponse, QualityIntervalRecord } from "./types";
 
 const palette = ["#5eead4", "#60a5fa", "#c084fc", "#f472b6", "#facc15"];
@@ -153,9 +153,9 @@ export class LatencyChart {
       (item) => timestampMs >= item.startMs && timestampMs <= (item.endMs ?? this.history!.toMs),
     );
     const intervalText = interval
-      ? `<div class="tooltip-state state-${interval.state}">${interval.state}</div>`
+      ? `<div class="tooltip-state state-${interval.state}">${stateLabel(interval.state)}</div>`
       : "";
-    this.tooltip.innerHTML = `<time>${new Date(timestampMs).toLocaleString()}</time>${values}${intervalText}`;
+    this.tooltip.innerHTML = `<time>${formatDateTime(timestampMs)}</time>${values}${intervalText}`;
     this.tooltip.style.left = `${Math.min((plot.cursor.left ?? 0) + 14, this.container.clientWidth - 190)}px`;
     this.tooltip.style.top = `${Math.max(8, (plot.cursor.top ?? 0) - 30)}px`;
     this.tooltip.classList.add("visible");

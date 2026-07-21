@@ -11,8 +11,10 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::{
     domain::{
-        DashboardSnapshot, QualityState, QualityTransitionEvent, StateTransition, unix_time_ms,
+        AppSettings, DashboardSnapshot, QualityState, QualityTransitionEvent, StateTransition,
+        unix_time_ms,
     },
+    i18n::{Language, active_language, message, state_label, target_count, text},
     monitor::MonitorEventSink,
     storage::Database,
 };
@@ -35,14 +37,13 @@ impl TauriEventSink {
     }
 
     fn notify_transition(&self, event: &QualityTransitionEvent) {
+        let Ok(settings) = self.database.load_settings() else {
+            return;
+        };
         let should_notify = matches!(
             event.transition.to,
             QualityState::Unstable | QualityState::Disconnected | QualityState::Stable
-        ) && self
-            .database
-            .load_settings()
-            .map(|settings| settings.notifications_enabled)
-            .unwrap_or(false);
+        ) && settings.notifications_enabled;
         if !should_notify {
             return;
         }
@@ -59,12 +60,14 @@ impl TauriEventSink {
         notifications.insert(key, now_ms);
         drop(notifications);
 
-        let body = match event.transition.to {
-            QualityState::Unstable => format!("{} network quality is unstable", event.target.name),
-            QualityState::Disconnected => format!("{} is not responding", event.target.name),
-            QualityState::Stable => format!("{} connection has recovered", event.target.name),
+        let language = active_language(settings.language);
+        let key = match event.transition.to {
+            QualityState::Unstable => "notification.unstable",
+            QualityState::Disconnected => "notification.disconnected",
+            QualityState::Stable => "notification.recovered",
             _ => return,
         };
+        let body = message(language, key, &[("name", &event.target.name)]);
         let _ = self
             .app
             .notification()
@@ -78,7 +81,9 @@ impl TauriEventSink {
 impl MonitorEventSink for TauriEventSink {
     fn dashboard_updated(&self, snapshot: DashboardSnapshot) {
         let _ = self.app.emit("dashboard-updated", &snapshot);
-        update_tray(&self.app, &snapshot);
+        if let Ok(settings) = self.database.load_settings() {
+            update_tray(&self.app, &snapshot, &settings);
+        }
     }
 
     fn quality_transition(&self, event: QualityTransitionEvent) {
@@ -86,33 +91,58 @@ impl MonitorEventSink for TauriEventSink {
         self.notify_transition(&event);
     }
 
-    fn monitor_error(&self, target_id: Option<&str>, message: &str) {
+    fn monitor_error(&self, target_id: Option<&str>, code: &str, detail: &str) {
         let _ = self.app.emit(
             "monitor-error",
-            serde_json::json!({ "targetId": target_id, "message": message }),
+            serde_json::json!({ "targetId": target_id, "code": code, "detail": detail }),
         );
     }
 }
 
-pub fn build_tray<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
-    let quick = MenuItem::with_id(app, "quick", "Quick status", true, None::<&str>)?;
-    let open = MenuItem::with_id(app, "open", "Open LNPM", true, None::<&str>)?;
-    let pause = MenuItem::with_id(
-        app,
-        "pause",
-        "Pause or resume monitoring",
-        true,
-        None::<&str>,
-    )?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&quick, &open, &pause, &quit])?;
+pub fn build_tray<R: Runtime>(app: &App<R>, settings: &AppSettings) -> tauri::Result<()> {
+    let language = active_language(settings.language);
+    let menu = tray_menu(app, language)?;
+    let tooltip = format!("LNPM · {}", text(language, "tray.starting"));
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(status_icon(QualityState::WarmingUp))
-        .tooltip("LNPM · Starting")
+        .tooltip(tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .build(app)?;
     Ok(())
+}
+
+pub fn refresh_tray(
+    app: &AppHandle,
+    settings: &AppSettings,
+    snapshot: &DashboardSnapshot,
+) -> tauri::Result<()> {
+    let language = active_language(settings.language);
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        tray.set_menu(Some(tray_menu(app, language)?))?;
+    }
+    update_tray(app, snapshot, settings);
+    Ok(())
+}
+
+fn tray_menu<R: Runtime, M: Manager<R>>(app: &M, language: Language) -> tauri::Result<Menu<R>> {
+    let quick = MenuItem::with_id(
+        app,
+        "quick",
+        text(language, "tray.quickStatus"),
+        true,
+        None::<&str>,
+    )?;
+    let open = MenuItem::with_id(app, "open", text(language, "tray.open"), true, None::<&str>)?;
+    let pause = MenuItem::with_id(
+        app,
+        "pause",
+        text(language, "tray.pauseResume"),
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(app, "quit", text(language, "tray.quit"), true, None::<&str>)?;
+    Menu::with_items(app, &[&quick, &open, &pause, &quit])
 }
 
 pub fn handle_menu_event(app: &AppHandle, id: &str) {
@@ -190,21 +220,19 @@ pub fn show_popup_window(app: &AppHandle, cursor: Option<PhysicalPosition<f64>>)
     let _ = window.set_focus();
 }
 
-fn update_tray(app: &AppHandle, snapshot: &DashboardSnapshot) {
+fn update_tray(app: &AppHandle, snapshot: &DashboardSnapshot, settings: &AppSettings) {
     let state = aggregate_state(snapshot);
-    let state_text = match state {
-        QualityState::Stable => "Stable",
-        QualityState::Unstable => "Unstable",
-        QualityState::Disconnected => "Disconnected",
-        QualityState::Paused => "Paused",
-        QualityState::Error => "Error",
-        _ => "Starting",
+    let language = active_language(settings.language);
+    let state_text = if state == QualityState::WarmingUp {
+        text(language, "tray.starting")
+    } else {
+        state_label(language, state)
     };
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(status_icon(state)));
         let _ = tray.set_tooltip(Some(format!(
-            "LNPM · {state_text} · {} target(s)",
-            snapshot.targets.len()
+            "LNPM · {state_text} · {}",
+            target_count(language, snapshot.targets.len())
         )));
     }
 }

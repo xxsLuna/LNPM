@@ -145,8 +145,13 @@ export interface AppSettings {
   retentionDays: number | null;
   notificationsEnabled: boolean;
   startAtLogin: boolean;
-  language: "auto" | "ko" | "en";
+  language: "auto" | "en" | "ko" | "ja" | "zh-CN" | "zh-TW";
   firstRun: boolean;
+}
+
+export interface UserErrorPayload {
+  code: string;
+  detail?: string | null;
 }
 
 export interface StorageInfo {

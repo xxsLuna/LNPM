@@ -15,7 +15,7 @@ use tokio::time::MissedTickBehavior;
 use crate::{
     domain::{
         DashboardSnapshot, LiveTargetStatus, PingSample, QualityMetrics, QualityState,
-        QualityTransitionEvent, Target, unix_time_ms,
+        QualityTransitionEvent, Target, TargetValidationError, unix_time_ms,
     },
     probe::PingProbe,
     quality::QualityClassifier,
@@ -26,14 +26,31 @@ use crate::{
 pub enum MonitorError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Validation(#[from] TargetValidationError),
     #[error("target not found: {0}")]
     TargetNotFound(String),
+}
+
+impl MonitorError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Storage(error) => match error {
+                StorageError::Database(_) => "storage",
+                StorageError::Io(_) => "filesystem",
+                StorageError::Json(_) => "serialization",
+                StorageError::InvalidData(_) => "invalidData",
+            },
+            Self::Validation(error) => error.code(),
+            Self::TargetNotFound(_) => "targetNotFound",
+        }
+    }
 }
 
 pub trait MonitorEventSink: Send + Sync {
     fn dashboard_updated(&self, snapshot: DashboardSnapshot);
     fn quality_transition(&self, event: QualityTransitionEvent);
-    fn monitor_error(&self, target_id: Option<&str>, message: &str);
+    fn monitor_error(&self, target_id: Option<&str>, code: &str, detail: &str);
 }
 
 #[derive(Default)]
@@ -42,7 +59,7 @@ pub struct NoopEventSink;
 impl MonitorEventSink for NoopEventSink {
     fn dashboard_updated(&self, _snapshot: DashboardSnapshot) {}
     fn quality_transition(&self, _event: QualityTransitionEvent) {}
-    fn monitor_error(&self, _target_id: Option<&str>, _message: &str) {}
+    fn monitor_error(&self, _target_id: Option<&str>, _code: &str, _detail: &str) {}
 }
 
 struct TargetRuntime {
@@ -104,7 +121,7 @@ impl MonitorService {
     }
 
     pub fn upsert_target(self: &Arc<Self>, mut target: Target) -> Result<Target, MonitorError> {
-        target.validate().map_err(StorageError::InvalidData)?;
+        target.validate()?;
         if let Some(existing) = self.database.get_target(&target.id)? {
             if existing.host != target.host || existing.address_family != target.address_family {
                 let now_ms = unix_time_ms();
@@ -186,8 +203,11 @@ impl MonitorService {
             task.abort();
         }
         if let Err(error) = self.database.close_open_intervals(unix_time_ms()) {
-            self.event_sink
-                .monitor_error(None, &format!("failed to close intervals: {error}"));
+            self.event_sink.monitor_error(
+                None,
+                "storage",
+                &format!("failed to close intervals: {error}"),
+            );
         }
     }
 
@@ -319,7 +339,7 @@ async fn run_target_loop(service: Weak<MonitorService>, target_id: String) {
         if let Err(error) = service.perform_probe(&target_id).await {
             service
                 .event_sink
-                .monitor_error(Some(&target_id), &error.to_string());
+                .monitor_error(Some(&target_id), error.code(), &error.to_string());
         }
     }
 }

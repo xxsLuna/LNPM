@@ -24,7 +24,7 @@
       },
       {
         "label": "popup",
-        "title": "LNPM Status",
+        "title": "LNPM",
         "url": "index.html?view=popup",
         "width": 420,
         "height": 320,

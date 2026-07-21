@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod domain;
+pub mod i18n;
 pub mod monitor;
 pub mod probe;
 pub mod quality;
@@ -46,7 +47,7 @@ pub fn run() {
                 monitor: Arc::clone(&monitor),
                 database: database.clone(),
             });
-            build_tray(app)?;
+            build_tray(app, &settings)?;
 
             if settings.first_run || monitor.snapshot().targets.is_empty() {
                 tray::show_main_window(app.handle());

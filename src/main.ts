@@ -5,11 +5,18 @@ import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./api";
 import { LatencyChart } from "./chart";
 import {
+  formatBytes,
   formatDuration,
+  formatError,
   formatLatency,
+  formatPercent,
+  probeStatusLabel,
   reasonLabel,
   resolveLanguage,
+  setLanguage,
   stateLabel,
+  t,
+  type Language,
 } from "./i18n";
 import type {
   AppSettings,
@@ -20,14 +27,14 @@ import type {
   QualityThresholds,
   QualityTransitionEvent,
   Target,
+  UserErrorPayload,
 } from "./types";
 import "./styles.css";
-
-type Language = "ko" | "en";
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("LNPM root element is missing");
 const root: HTMLDivElement = rootElement;
+const logoUrl = new URL("../docs/assets/lnpm-logo.png", import.meta.url).href;
 
 const isPopup = new URLSearchParams(location.search).get("view") === "popup";
 let settings: AppSettings = {
@@ -52,6 +59,8 @@ async function bootstrap(): Promise<void> {
   try {
     settings = await api.settings();
     language = resolveLanguage(settings.language);
+    setLanguage(language);
+    applyDocumentLanguage();
     dashboard = await api.dashboard();
   } catch (error) {
     console.error(error);
@@ -69,8 +78,15 @@ async function bootstrap(): Promise<void> {
     showTransitionToast(event.payload);
     if (isPopup) schedulePopupHide();
   });
-  await listen<{ targetId: string | null; message: string }>("monitor-error", (event) => {
-    showToast(event.payload.message, "error");
+  await listen<{ targetId: string | null } & UserErrorPayload>("monitor-error", (event) => {
+    showToast(formatError(event.payload), "error");
+  });
+  await listen<AppSettings>("settings-updated", (event) => {
+    const nextLanguage = resolveLanguage(event.payload.language);
+    settings = event.payload;
+    if (nextLanguage === language) return;
+    preserveViewState();
+    window.setTimeout(() => location.reload(), 50);
   });
 }
 
@@ -79,56 +95,56 @@ async function initMain(): Promise<void> {
   root.innerHTML = `
     <header class="app-header">
       <div class="brand-block">
-        <div class="brand-mark" aria-hidden="true"><span></span></div>
-        <div><h1>Live Network Ping Monitor</h1><p>${copy("Live network quality", "실시간 네트워크 품질")}</p></div>
+        <div class="brand-mark" aria-hidden="true"><img src="${logoUrl}" alt="" /></div>
+        <div><h1>${t("app.title")}</h1><p>${t("app.subtitle")}</p></div>
       </div>
       <div class="header-actions">
-        <button id="follow-live" class="button ghost active">● ${copy("Live", "실시간")}</button>
+        <button id="follow-live" class="button ghost active">● ${t("action.live")}</button>
         <button id="pause-monitoring" class="button ghost"></button>
-        <button id="open-settings" class="button icon-button" aria-label="Settings">⚙</button>
+        <button id="open-settings" class="button icon-button" aria-label="${t("action.settings")}">⚙</button>
       </div>
     </header>
     <div id="update-banner" class="update-banner hidden"></div>
     <main class="workspace">
       <aside class="target-sidebar">
         <div class="sidebar-heading">
-          <div><span class="eyebrow">${copy("MONITORS", "모니터")}</span><strong id="target-count">0</strong></div>
-          <button id="add-target" class="button add-button" aria-label="Add target">＋</button>
+          <div><span class="eyebrow">${t("section.monitors")}</span><strong id="target-count">0</strong></div>
+          <button id="add-target" class="button add-button" aria-label="${t("action.addTarget")}">＋</button>
         </div>
         <div id="target-list" class="target-list"></div>
         <div id="empty-targets" class="empty-targets hidden">
           <div class="empty-radar"></div>
-          <strong>${copy("No targets yet", "감시 대상이 없습니다")}</strong>
-          <p>${copy("Add a host or IP address to begin monitoring.", "호스트명이나 IP 주소를 추가해 측정을 시작하세요.")}</p>
-          <button class="button primary" data-action="add-target">${copy("Add target", "대상 추가")}</button>
+          <strong>${t("empty.targetsTitle")}</strong>
+          <p>${t("empty.targetsDescription")}</p>
+          <button class="button primary" data-action="add-target">${t("action.addTarget")}</button>
         </div>
       </aside>
       <section class="dashboard-panel">
         <div class="dashboard-heading">
           <div>
             <span id="selected-state" class="state-pill state-warmingUp"></span>
-            <h2 id="selected-name">${copy("Overview", "전체 현황")}</h2>
+            <h2 id="selected-name">${t("dashboard.overview")}</h2>
             <p id="selected-host">—</p>
           </div>
-          <div class="range-controls" role="group" aria-label="Chart range">
+          <div class="range-controls" role="group" aria-label="${t("dashboard.chartRange")}">
             <button data-range="3600000" class="range-button active">1H</button>
             <button data-range="86400000" class="range-button">24H</button>
             <button data-range="604800000" class="range-button">7D</button>
             <button data-range="2592000000" class="range-button">30D</button>
-            <button id="custom-range" class="range-button">${copy("Custom", "직접 선택")}</button>
+            <button id="custom-range" class="range-button">${t("action.custom")}</button>
           </div>
         </div>
         <div class="chart-card">
           <div id="main-chart" class="chart-host"></div>
-          <div id="chart-loading" class="chart-loading hidden">${copy("Loading history…", "기록을 불러오는 중…")}</div>
+          <div id="chart-loading" class="chart-loading hidden">${t("dashboard.loadingHistory")}</div>
           <div class="chart-legend" id="chart-legend"></div>
         </div>
         <div class="summary-grid">
-          <article class="metric-card"><span>${copy("Average", "평균 지연")}</span><strong id="metric-average">—</strong></article>
-          <article class="metric-card"><span>P95</span><strong id="metric-p95">—</strong></article>
-          <article class="metric-card warning"><span>${copy("Unstable", "불안정")}</span><strong id="metric-unstable">—</strong><small id="metric-unstable-time"></small></article>
-          <article class="metric-card danger"><span>${copy("Disconnected", "연결 끊김")}</span><strong id="metric-disconnected">—</strong><small id="metric-disconnected-time"></small></article>
-          <article class="metric-card"><span>${copy("Packet loss", "패킷 손실")}</span><strong id="metric-loss">—</strong></article>
+          <article class="metric-card"><span>${t("dashboard.average")}</span><strong id="metric-average">—</strong></article>
+          <article class="metric-card"><span>${t("dashboard.p95Latency")}</span><strong id="metric-p95">—</strong></article>
+          <article class="metric-card warning"><span>${t("dashboard.unstable")}</span><strong id="metric-unstable">—</strong><small id="metric-unstable-time"></small></article>
+          <article class="metric-card danger"><span>${t("dashboard.disconnected")}</span><strong id="metric-disconnected">—</strong><small id="metric-disconnected-time"></small></article>
+          <article class="metric-card"><span>${t("dashboard.packetLoss")}</span><strong id="metric-loss">—</strong></article>
         </div>
       </section>
     </main>
@@ -136,21 +152,25 @@ async function initMain(): Promise<void> {
     <dialog id="settings-dialog" class="modal settings-modal"></dialog>
     <dialog id="range-dialog" class="modal compact-modal">
       <form id="range-form">
-        <header><h3>${copy("Custom range", "날짜 범위 선택")}</h3><button type="button" class="modal-close">×</button></header>
-        <label>${copy("From", "시작")}<input id="range-from" type="datetime-local" required /></label>
-        <label>${copy("To", "종료")}<input id="range-to" type="datetime-local" required /></label>
-        <footer><button type="button" class="button ghost modal-close">${copy("Cancel", "취소")}</button><button class="button primary">${copy("Apply", "적용")}</button></footer>
+        <header><h3>${t("dashboard.customRange")}</h3><button type="button" class="modal-close" aria-label="${t("action.close")}">×</button></header>
+        <label>${t("dashboard.from")}<input id="range-from" type="datetime-local" required /></label>
+        <label>${t("dashboard.to")}<input id="range-to" type="datetime-local" required /></label>
+        <footer><button type="button" class="button ghost modal-close">${t("action.cancel")}</button><button class="button primary">${t("action.apply")}</button></footer>
       </form>
     </dialog>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
   `;
 
   bindMainEvents();
-  renderDashboard();
+  restoreViewState();
   if (dashboard.targets.length > 0) {
-    selectedTargetId = dashboard.targets[0].target.id;
+    if (!dashboard.targets.some((item) => item.target.id === selectedTargetId)) {
+      selectedTargetId = dashboard.targets[0].target.id;
+    }
+    renderDashboard();
     await loadHistory(currentRange.fromMs, currentRange.toMs);
   } else {
+    renderDashboard();
     openTargetDialog();
   }
   void checkForUpdates();
@@ -166,7 +186,9 @@ async function initMain(): Promise<void> {
 function bindMainEvents(): void {
   byId("add-target").addEventListener("click", () => openTargetDialog());
   root.querySelector('[data-action="add-target"]')?.addEventListener("click", () => openTargetDialog());
-  byId("open-settings").addEventListener("click", () => void openSettingsDialog());
+  byId("open-settings").addEventListener("click", () => {
+    void openSettingsDialog().catch((error) => showToast(formatError(error), "error"));
+  });
   byId("pause-monitoring").addEventListener("click", () => void api.pause(!dashboard.paused));
   byId("follow-live").addEventListener("click", () => {
     followLive = true;
@@ -197,7 +219,7 @@ function bindMainEvents(): void {
     const fromMs = new Date(byId<HTMLInputElement>("range-from").value).getTime();
     const toMs = new Date(byId<HTMLInputElement>("range-to").value).getTime();
     if (toMs <= fromMs) {
-      showToast(copy("End must be after start", "종료 시각은 시작 시각보다 뒤여야 합니다."), "error");
+      showToast(t("toast.endAfterStart"), "error");
       return;
     }
     followLive = false;
@@ -216,8 +238,8 @@ function renderDashboard(): void {
   byId("empty-targets").classList.toggle("hidden", dashboard.targets.length > 0);
   byId("target-list").classList.toggle("hidden", dashboard.targets.length === 0);
   byId("pause-monitoring").textContent = dashboard.paused
-    ? copy("▶ Resume", "▶ 재개")
-    : copy("Ⅱ Pause", "Ⅱ 일시정지");
+    ? `▶ ${t("action.resume")}`
+    : `Ⅱ ${t("action.pause")}`;
 
   if (selectedTargetId && !dashboard.targets.some((item) => item.target.id === selectedTargetId)) {
     selectedTargetId = dashboard.targets[0]?.target.id ?? null;
@@ -230,7 +252,7 @@ function renderDashboard(): void {
         <span class="status-dot state-${item.state}"></span>
         <span class="target-copy"><strong>${escapeHtml(item.target.name)}</strong><small>${escapeHtml(item.target.host)}</small></span>
         <span class="target-latency">${formatLatency(latency)}</span>
-        <span class="target-menu" data-edit-target="${item.target.id}" role="button" aria-label="${copy("Manage target", "대상 관리")}">${copy("Manage", "관리")}</span>
+        <span class="target-menu" data-edit-target="${item.target.id}" role="button" aria-label="${t("action.manageTarget")}">${t("action.manage")}</span>
       </button>`;
     })
     .join("");
@@ -250,7 +272,7 @@ function renderDashboard(): void {
   });
 
   const selected = selectedStatus();
-  byId("selected-name").textContent = selected?.target.name ?? copy("Overview", "전체 현황");
+  byId("selected-name").textContent = selected?.target.name ?? t("dashboard.overview");
   byId("selected-host").textContent = selected?.target.host ?? "—";
   const statePill = byId("selected-state");
   const state = selected?.state ?? aggregateState();
@@ -286,7 +308,7 @@ async function loadHistory(fromMs: number, toMs: number, showLoading = true): Pr
     renderLegend();
     renderSummary();
   } catch (error) {
-    showToast(String(error), "error");
+    showToast(formatError(error), "error");
   } finally {
     if (generation === loadGeneration && showLoading) byId("chart-loading").classList.add("hidden");
   }
@@ -314,9 +336,9 @@ function renderSummary(): void {
   const summary = history?.series.find((series) => series.target.id === selectedTargetId)?.summary;
   setText("metric-average", formatLatency(summary?.averageLatencyMs));
   setText("metric-p95", formatLatency(summary?.p95LatencyMs));
-  setText("metric-unstable", summary ? `${summary.unstablePercent.toFixed(2)}%` : "—");
-  setText("metric-disconnected", summary ? `${summary.disconnectedPercent.toFixed(2)}%` : "—");
-  setText("metric-loss", summary ? `${summary.packetLossPercent.toFixed(2)}%` : "—");
+  setText("metric-unstable", formatPercent(summary?.unstablePercent));
+  setText("metric-disconnected", formatPercent(summary?.disconnectedPercent));
+  setText("metric-loss", formatPercent(summary?.packetLossPercent));
   setText("metric-unstable-time", summary ? formatDuration(summary.unstableMs, language) : "");
   setText(
     "metric-disconnected-time",
@@ -329,27 +351,27 @@ function openTargetDialog(existing?: Target): void {
   const target = existing ?? temporaryTarget();
   dialog.innerHTML = `
     <form id="target-form">
-      <header><div><span class="eyebrow">${existing ? copy("EDIT MONITOR", "모니터 수정") : copy("NEW MONITOR", "새 모니터")}</span><h3>${existing ? escapeHtml(existing.name) : copy("Add a target", "대상 추가")}</h3></div><button type="button" class="modal-close">×</button></header>
+      <header><div><span class="eyebrow">${existing ? t("target.editMonitor") : t("target.newMonitor")}</span><h3>${existing ? escapeHtml(existing.name) : t("action.addTarget")}</h3></div><button type="button" class="modal-close" aria-label="${t("action.close")}">×</button></header>
       <input id="target-id" type="hidden" value="${escapeHtml(existing?.id ?? "")}" />
       <div class="form-grid two-columns">
-        <label>${copy("Display name", "표시 이름")}<input id="target-name" value="${escapeHtml(target.name)}" required maxlength="40" placeholder="Cloudflare DNS" /></label>
-        <label>${copy("Hostname or IP", "호스트명 또는 IP")}<input id="target-host" value="${escapeHtml(target.host)}" required placeholder="1.1.1.1" /></label>
+        <label>${t("target.displayName")}<input id="target-name" value="${escapeHtml(target.name)}" required maxlength="40" placeholder="Cloudflare DNS" /></label>
+        <label>${t("target.hostname")}<input id="target-host" value="${escapeHtml(target.host)}" required placeholder="1.1.1.1" /></label>
       </div>
       <div class="form-grid three-columns">
-        <label>${copy("Address family", "주소 유형")}<select id="target-family"><option value="auto">Auto</option><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label>
-        <label>${copy("Interval", "측정 주기")}<div class="input-suffix"><input id="target-interval" type="number" min="1" max="60" value="${target.intervalMs / 1_000}" /><span>s</span></div></label>
-        <label>${copy("Timeout", "타임아웃")}<div class="input-suffix"><input id="target-timeout" type="number" min="250" max="10000" step="250" value="${target.timeoutMs}" /><span>ms</span></div></label>
+        <label>${t("target.addressFamily")}<select id="target-family"><option value="auto">${t("target.addressAuto")}</option><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label>
+        <label>${t("target.interval")}<div class="input-suffix"><input id="target-interval" type="number" min="1" max="60" value="${target.intervalMs / 1_000}" /><span>s</span></div></label>
+        <label>${t("target.timeout")}<div class="input-suffix"><input id="target-timeout" type="number" min="250" max="10000" step="250" value="${target.timeoutMs}" /><span>ms</span></div></label>
       </div>
-      <fieldset><legend>${copy("Unstable thresholds", "불안정 판정 기준")}</legend><div class="form-grid three-columns">
-        <label>${copy("Packet loss", "패킷 손실")}<div class="input-suffix"><input id="threshold-loss" type="number" min="0" max="100" step="0.5" value="${target.thresholds.packetLossPercent}" /><span>%</span></div></label>
-        <label>${copy("Jitter", "지터")}<div class="input-suffix"><input id="threshold-jitter" type="number" min="1" max="1000" value="${target.thresholds.jitterMs}" /><span>ms</span></div></label>
-        <label>P95 latency<div class="input-suffix"><input id="threshold-p95" type="number" min="1" max="10000" value="${target.thresholds.p95LatencyMs}" /><span>ms</span></div></label>
+      <fieldset><legend>${t("target.unstableThresholds")}</legend><div class="form-grid three-columns">
+        <label>${t("dashboard.packetLoss")}<div class="input-suffix"><input id="threshold-loss" type="number" min="0" max="100" step="0.5" value="${target.thresholds.packetLossPercent}" /><span>%</span></div></label>
+        <label>${t("target.jitter")}<div class="input-suffix"><input id="threshold-jitter" type="number" min="1" max="1000" value="${target.thresholds.jitterMs}" /><span>ms</span></div></label>
+        <label>${t("dashboard.p95Latency")}<div class="input-suffix"><input id="threshold-p95" type="number" min="1" max="10000" value="${target.thresholds.p95LatencyMs}" /><span>ms</span></div></label>
       </div></fieldset>
-      <label class="toggle-row"><input id="target-enabled" type="checkbox" ${target.enabled ? "checked" : ""}/><span><strong>${copy("Monitoring enabled", "모니터링 활성화")}</strong><small>${copy("Collect samples while LNPM is running", "LNPM 실행 중 측정값을 수집합니다")}</small></span></label>
+      <label class="toggle-row"><input id="target-enabled" type="checkbox" ${target.enabled ? "checked" : ""}/><span><strong>${t("target.monitoringEnabled")}</strong><small>${t("target.collectSamples")}</small></span></label>
       <div id="target-test-result" class="test-result"></div>
       <footer>
-        <div>${existing ? `<button id="delete-target" type="button" class="button danger-text">${copy("Remove monitor", "모니터 삭제")}</button>` : ""}</div>
-        <div><button id="test-target" type="button" class="button ghost">${copy("Test ping", "Ping 테스트")}</button><button type="submit" class="button primary">${copy("Save", "저장")}</button></div>
+        <div>${existing ? `<button id="delete-target" type="button" class="button danger-text">${t("action.removeMonitor")}</button>` : ""}</div>
+        <div><button id="test-target" type="button" class="button ghost">${t("action.testPing")}</button><button type="submit" class="button primary">${t("action.save")}</button></div>
       </footer>
     </form>`;
   byId<HTMLSelectElement>("target-family").value = target.addressFamily;
@@ -387,17 +409,17 @@ function readTargetForm(base: Target): Target {
 async function testTargetForm(base: Target): Promise<void> {
   const result = byId("target-test-result");
   result.className = "test-result visible";
-  result.textContent = copy("Testing…", "테스트 중…");
+  result.textContent = t("test.testing");
   try {
     const sample = await api.testTarget(readTargetForm(base));
     result.className = `test-result visible ${sample.status === "success" ? "success" : "error"}`;
     result.textContent =
       sample.status === "success"
-        ? `${copy("Reply", "응답")} ${formatLatency(sample.latencyMs)} · ${sample.resolvedAddress ?? ""}`
-        : `${sample.status}: ${sample.error ?? copy("No response", "응답 없음")}`;
+        ? `${t("test.reply")} ${formatLatency(sample.latencyMs)} · ${sample.resolvedAddress ?? ""}`
+        : `${probeStatusLabel(sample.status)}${sample.error ? `\n${sample.error}` : ` · ${t("test.noResponse")}`}`;
   } catch (error) {
     result.className = "test-result visible error";
-    result.textContent = String(error);
+    result.textContent = formatError(error);
   }
 }
 
@@ -417,49 +439,51 @@ async function saveTargetForm(base: Target, dialog: HTMLDialogElement): Promise<
     renderDashboard();
     const toMs = Date.now();
     await loadHistory(toMs - (currentRange.toMs - currentRange.fromMs), toMs);
-    showToast(copy("Target saved", "대상을 저장했습니다"), "success");
+    showToast(t("toast.targetSaved"), "success");
   } catch (error) {
-    showToast(String(error), "error");
+    showToast(formatError(error), "error");
   }
 }
 
 async function removeTarget(target: Target, dialog: HTMLDialogElement): Promise<void> {
-  const accepted = confirm(
-    copy(
-      `Remove ${target.name}? Historical data will be kept.`,
-      `${target.name} 대상을 삭제할까요? 과거 기록은 유지됩니다.`,
-    ),
-  );
+  const accepted = confirm(t("toast.removeConfirm", { name: target.name }));
   if (!accepted) return;
-  await api.archiveTarget(target.id);
-  dialog.close();
-  dashboard = await api.dashboard();
-  selectedTargetId = dashboard.targets[0]?.target.id ?? null;
-  renderDashboard();
-  if (selectedTargetId) await loadHistory(currentRange.fromMs, currentRange.toMs);
-  else {
-    chart?.destroy();
-    chart = null;
-    history = null;
+  try {
+    await api.archiveTarget(target.id);
+    dialog.close();
+    dashboard = await api.dashboard();
+    selectedTargetId = dashboard.targets[0]?.target.id ?? null;
+    renderDashboard();
+    if (selectedTargetId) await loadHistory(currentRange.fromMs, currentRange.toMs);
+    else {
+      chart?.destroy();
+      chart = null;
+      history = null;
+    }
+  } catch (error) {
+    showToast(formatError(error), "error");
   }
 }
 
 async function openSettingsDialog(): Promise<void> {
   const dialog = byId<HTMLDialogElement>("settings-dialog");
   const storage = await api.storageInfo();
+  const retentionOptions = [7, 30, 90, 180, 365]
+    .map((days) => `<option value="${days}">${t("settings.days", { count: days })}</option>`)
+    .join("");
   dialog.innerHTML = `
     <form id="settings-form" class="settings-form">
-      <header><div><span class="eyebrow">LNPM</span><h3>${copy("Settings", "설정")}</h3></div><button type="button" class="modal-close">×</button></header>
+      <header><div><span class="eyebrow">LNPM</span><h3>${t("action.settings")}</h3></div><button type="button" class="modal-close" aria-label="${t("action.close")}">×</button></header>
       <div class="settings-scroll-area">
-        <section class="settings-section"><h4>${copy("Monitoring", "모니터링")}</h4>
-          <label>${copy("Raw sample retention", "원본 보존 기간")}<select id="retention-days"><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">365 days</option><option value="unlimited">Unlimited</option></select></label>
-          <label class="toggle-row"><input id="notifications-enabled" type="checkbox" ${settings.notificationsEnabled ? "checked" : ""}/><span><strong>${copy("Notifications", "상태 알림")}</strong><small>${copy("Notify on unstable, disconnected and recovered states", "불안정·끊김·복구 상태를 알립니다")}</small></span></label>
-          <label class="toggle-row"><input id="start-at-login" type="checkbox" ${settings.startAtLogin ? "checked" : ""}/><span><strong>${copy("Start at login", "로그인 시 자동 시작")}</strong><small>${copy("Start LNPM in the tray", "LNPM을 트레이에서 자동 실행합니다")}</small></span></label>
+        <section class="settings-section"><h4>${t("section.monitoring")}</h4>
+          <label>${t("settings.rawRetention")}<select id="retention-days">${retentionOptions}<option value="unlimited">${t("settings.unlimited")}</option></select></label>
+          <label class="toggle-row"><input id="notifications-enabled" type="checkbox" ${settings.notificationsEnabled ? "checked" : ""}/><span><strong>${t("settings.notifications")}</strong><small>${t("settings.notificationsDescription")}</small></span></label>
+          <label class="toggle-row"><input id="start-at-login" type="checkbox" ${settings.startAtLogin ? "checked" : ""}/><span><strong>${t("settings.startAtLogin")}</strong><small>${t("settings.startAtLoginDescription")}</small></span></label>
         </section>
-        <section class="settings-section"><h4>${copy("Appearance", "표시")}</h4><label>${copy("Language", "언어")}<select id="language"><option value="auto">System default</option><option value="ko">한국어</option><option value="en">English</option></select></label></section>
-        <section class="settings-section data-section"><h4>${copy("Data", "데이터")}</h4><div><span>${formatBytes(storage.databaseSizeBytes)}</span><small>${escapeHtml(storage.databasePath)}</small></div><div class="inline-actions"><button id="open-data" type="button" class="button ghost">${copy("Open folder", "폴더 열기")}</button><button id="backup-data" type="button" class="button ghost">${copy("Create backup", "백업 생성")}</button><button id="cleanup-data" type="button" class="button ghost">${copy("Clean now", "지금 정리")}</button></div></section>
+        <section class="settings-section"><h4>${t("section.appearance")}</h4><label>${t("settings.language")}<select id="language"><option value="auto">${t("settings.systemDefault")}</option><option value="en">English</option><option value="ko">한국어</option><option value="ja">日本語</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option></select></label></section>
+        <section class="settings-section data-section"><h4>${t("section.data")}</h4><div><span>${formatBytes(storage.databaseSizeBytes)}</span><small>${escapeHtml(storage.databasePath)}</small></div><div class="inline-actions"><button id="open-data" type="button" class="button ghost">${t("action.openFolder")}</button><button id="backup-data" type="button" class="button ghost">${t("action.createBackup")}</button><button id="cleanup-data" type="button" class="button ghost">${t("action.cleanNow")}</button></div></section>
       </div>
-      <footer><span>v${await getVersion()}</span><div><button type="button" class="button ghost modal-close">${copy("Cancel", "취소")}</button><button class="button primary">${copy("Save", "저장")}</button></div></footer>
+      <footer><span>v${await getVersion()}</span><div><button type="button" class="button ghost modal-close">${t("action.cancel")}</button><button class="button primary">${t("action.save")}</button></div></footer>
     </form>`;
   byId<HTMLSelectElement>("retention-days").value = settings.retentionDays?.toString() ?? "unlimited";
   byId<HTMLSelectElement>("language").value = settings.language;
@@ -468,27 +492,40 @@ async function openSettingsDialog(): Promise<void> {
   );
   byId("open-data").addEventListener("click", () => void openPath(storage.dataDirectory));
   byId("backup-data").addEventListener("click", async () => {
-    const path = await api.backup();
-    showToast(copy(`Backup created: ${path}`, `백업 생성: ${path}`), "success");
+    try {
+      const path = await api.backup();
+      showToast(t("toast.backupCreated", { path }), "success");
+    } catch (error) {
+      showToast(formatError(error), "error");
+    }
   });
   byId("cleanup-data").addEventListener("click", async () => {
-    const deleted = await api.cleanup();
-    showToast(copy(`Removed ${deleted} raw samples`, `원본 ${deleted}개를 정리했습니다`), "success");
+    try {
+      const deleted = await api.cleanup();
+      showToast(t("toast.removedSamples", { count: deleted }), "success");
+    } catch (error) {
+      showToast(formatError(error), "error");
+    }
   });
   byId<HTMLFormElement>("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const retention = byId<HTMLSelectElement>("retention-days").value;
-    settings = await api.saveSettings({
-      ...settings,
-      retentionDays: retention === "unlimited" ? null : Number(retention),
-      notificationsEnabled: byId<HTMLInputElement>("notifications-enabled").checked,
-      startAtLogin: byId<HTMLInputElement>("start-at-login").checked,
-      language: byId<HTMLSelectElement>("language").value as AppSettings["language"],
-      firstRun: false,
-    });
-    dialog.close();
-    if (language !== resolveLanguage(settings.language)) location.reload();
-    else showToast(copy("Settings saved", "설정을 저장했습니다"), "success");
+    try {
+      const retention = byId<HTMLSelectElement>("retention-days").value;
+      settings = await api.saveSettings({
+        ...settings,
+        retentionDays: retention === "unlimited" ? null : Number(retention),
+        notificationsEnabled: byId<HTMLInputElement>("notifications-enabled").checked,
+        startAtLogin: byId<HTMLInputElement>("start-at-login").checked,
+        language: byId<HTMLSelectElement>("language").value as AppSettings["language"],
+        firstRun: false,
+      });
+      dialog.close();
+      if (language === resolveLanguage(settings.language)) {
+        showToast(t("toast.settingsSaved"), "success");
+      }
+    } catch (error) {
+      showToast(formatError(error), "error");
+    }
   });
   dialog.showModal();
 }
@@ -497,11 +534,11 @@ async function initPopup(): Promise<void> {
   root.className = "popup-shell";
   root.innerHTML = `
     <section class="popup-card">
-      <header><div class="brand-mark small"><span></span></div><div><strong>LNPM</strong><span id="popup-overall"></span></div><button id="popup-close" aria-label="Close">×</button></header>
+      <header><div class="brand-mark small"><img src="${logoUrl}" alt="" /></div><div><strong>LNPM</strong><span id="popup-overall"></span></div><button id="popup-close" aria-label="${t("action.close")}">×</button></header>
       <div id="popup-alert" class="popup-alert hidden"></div>
       <div id="popup-targets" class="popup-targets"></div>
       <div id="popup-chart" class="popup-chart"></div>
-      <footer><button id="popup-pause" class="button ghost"></button><button id="popup-details" class="button primary">${copy("Details", "상세 보기")} ↗</button></footer>
+      <footer><button id="popup-pause" class="button ghost"></button><button id="popup-details" class="button primary">${t("action.details")} ↗</button></footer>
     </section>
     <div id="toast-stack" class="toast-stack"></div>`;
   byId("popup-close").addEventListener("click", () => void api.hidePopup());
@@ -519,15 +556,15 @@ function renderPopupStatus(): void {
   overallElement.className = `state-text state-${overall}`;
   overallElement.textContent = stateLabel(overall, language);
   byId("popup-pause").textContent = dashboard.paused
-    ? copy("Resume", "재개")
-    : copy("Pause", "일시정지");
+    ? t("action.resume")
+    : t("action.pause");
   byId("popup-targets").innerHTML = dashboard.targets.length
     ? dashboard.targets
         .map(
           (item) => `<div class="popup-target-row"><span class="status-dot state-${item.state}"></span><strong>${escapeHtml(item.target.name)}</strong><small>${stateLabel(item.state, language)}</small><span>${formatLatency(item.latestSample?.latencyMs)}</span></div>`,
         )
         .join("")
-    : `<div class="popup-empty">${copy("Open details to add a monitor", "상세 화면에서 모니터를 추가하세요")}</div>`;
+    : `<div class="popup-empty">${t("empty.popup")}</div>`;
 }
 
 async function loadPopupHistory(): Promise<void> {
@@ -580,7 +617,7 @@ async function checkForUpdates(): Promise<void> {
     if (!isNewerVersion(release.tag_name, current)) return;
     const banner = byId("update-banner");
     banner.classList.remove("hidden");
-    banner.innerHTML = `<span>${copy(`LNPM ${release.tag_name} is available.`, `LNPM ${release.tag_name} 버전이 있습니다.`)}</span><button class="button ghost">${copy("View release", "릴리스 보기")}</button>`;
+    banner.innerHTML = `<span>${t("update.available", { version: release.tag_name })}</span><button class="button ghost">${t("action.viewRelease")}</button>`;
     banner.querySelector("button")?.addEventListener("click", () => void openUrl(release.html_url));
   } catch (error) {
     console.debug("Update check failed", error);
@@ -648,10 +685,6 @@ function showToast(message: string, kind: string): void {
   }, 4_500);
 }
 
-function copy(en: string, ko: string): string {
-  return language === "ko" ? ko : en;
-}
-
 function byId<T extends HTMLElement = HTMLElement>(id: string): T {
   const element = document.getElementById(id);
   if (!element) throw new Error(`Missing element #${id}`);
@@ -666,13 +699,6 @@ function setText(id: string, value: string): void {
 function toLocalInput(timestampMs: number): string {
   const date = new Date(timestampMs - new Date(timestampMs).getTimezoneOffset() * 60_000);
   return date.toISOString().slice(0, 16);
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1_024) return `${bytes} B`;
-  if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
-  if (bytes < 1_073_741_824) return `${(bytes / 1_048_576).toFixed(1)} MB`;
-  return `${(bytes / 1_073_741_824).toFixed(2)} GB`;
 }
 
 function isNewerVersion(tag: string, current: string): boolean {
@@ -696,4 +722,52 @@ function escapeHtml(value: string): string {
     };
     return entities[character];
   });
+}
+
+const viewStateKey = "lnpm-view-state";
+
+function applyDocumentLanguage(): void {
+  document.documentElement.lang = language;
+  document.title = isPopup ? t("app.popupTitle") : "LNPM";
+}
+
+function preserveViewState(): void {
+  if (isPopup) return;
+  sessionStorage.setItem(
+    viewStateKey,
+    JSON.stringify({ selectedTargetId, currentRange, followLive }),
+  );
+}
+
+function restoreViewState(): void {
+  if (isPopup) return;
+  const stored = sessionStorage.getItem(viewStateKey);
+  sessionStorage.removeItem(viewStateKey);
+  if (!stored) return;
+  try {
+    const parsed = JSON.parse(stored) as {
+      selectedTargetId?: unknown;
+      currentRange?: { fromMs?: unknown; toMs?: unknown };
+      followLive?: unknown;
+    };
+    selectedTargetId =
+      typeof parsed.selectedTargetId === "string" ? parsed.selectedTargetId : selectedTargetId;
+    if (
+      typeof parsed.currentRange?.fromMs === "number" &&
+      typeof parsed.currentRange.toMs === "number" &&
+      parsed.currentRange.toMs > parsed.currentRange.fromMs
+    ) {
+      currentRange = {
+        fromMs: parsed.currentRange.fromMs,
+        toMs: parsed.currentRange.toMs,
+      };
+    }
+    if (typeof parsed.followLive === "boolean") followLive = parsed.followLive;
+    byId("follow-live").classList.toggle("active", followLive);
+    if (!followLive) {
+      root.querySelectorAll("[data-range]").forEach((button) => button.classList.remove("active"));
+    }
+  } catch (error) {
+    console.debug("Unable to restore view state", error);
+  }
 }

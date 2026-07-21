@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,24 +72,50 @@ impl Target {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), TargetValidationError> {
         let host = self.host.trim();
         if host.is_empty() {
-            return Err("Host is required".into());
+            return Err(TargetValidationError::HostRequired);
         }
         if host.contains("://") || host.contains('/') || host.contains(' ') {
-            return Err("Enter a hostname or IP address without a URL scheme or path".into());
+            return Err(TargetValidationError::InvalidHost);
         }
         if !(1_000..=60_000).contains(&self.interval_ms) {
-            return Err("Interval must be between 1 and 60 seconds".into());
+            return Err(TargetValidationError::IntervalRange);
         }
         if !(250..=10_000).contains(&self.timeout_ms) {
-            return Err("Timeout must be between 250 ms and 10 seconds".into());
+            return Err(TargetValidationError::TimeoutRange);
         }
         if self.timeout_ms > self.interval_ms {
-            return Err("Timeout cannot be greater than the sampling interval".into());
+            return Err(TargetValidationError::TimeoutInterval);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum TargetValidationError {
+    #[error("Host is required")]
+    HostRequired,
+    #[error("Enter a hostname or IP address without a URL scheme or path")]
+    InvalidHost,
+    #[error("Interval must be between 1 and 60 seconds")]
+    IntervalRange,
+    #[error("Timeout must be between 250 ms and 10 seconds")]
+    TimeoutRange,
+    #[error("Timeout cannot be greater than the sampling interval")]
+    TimeoutInterval,
+}
+
+impl TargetValidationError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::HostRequired => "hostRequired",
+            Self::InvalidHost => "invalidHost",
+            Self::IntervalRange => "intervalRange",
+            Self::TimeoutRange => "timeoutRange",
+            Self::TimeoutInterval => "timeoutInterval",
+        }
     }
 }
 
@@ -309,13 +336,30 @@ pub struct StorageInfo {
     pub database_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LanguagePreference {
+    #[serde(rename = "auto")]
+    #[default]
+    Auto,
+    #[serde(rename = "en")]
+    En,
+    #[serde(rename = "ko")]
+    Ko,
+    #[serde(rename = "ja")]
+    Ja,
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "zh-TW")]
+    ZhTw,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub retention_days: Option<u32>,
     pub notifications_enabled: bool,
     pub start_at_login: bool,
-    pub language: String,
+    pub language: LanguagePreference,
     pub first_run: bool,
 }
 
@@ -325,7 +369,7 @@ impl Default for AppSettings {
             retention_days: Some(30),
             notifications_enabled: true,
             start_at_login: false,
-            language: "auto".into(),
+            language: LanguagePreference::Auto,
             first_run: true,
         }
     }
@@ -348,11 +392,31 @@ mod tests {
         assert!(target.validate().is_ok());
 
         target.host = "https://google.com/path".into();
-        assert!(target.validate().is_err());
+        assert_eq!(target.validate(), Err(TargetValidationError::InvalidHost));
 
         target.host = "1.1.1.1".into();
         target.interval_ms = 1_000;
         target.timeout_ms = 2_000;
-        assert!(target.validate().is_err());
+        assert_eq!(
+            target.validate(),
+            Err(TargetValidationError::TimeoutInterval)
+        );
+    }
+
+    #[test]
+    fn deserializes_existing_and_new_language_preferences() {
+        for (json, expected) in [
+            (r#""auto""#, LanguagePreference::Auto),
+            (r#""en""#, LanguagePreference::En),
+            (r#""ko""#, LanguagePreference::Ko),
+            (r#""ja""#, LanguagePreference::Ja),
+            (r#""zh-CN""#, LanguagePreference::ZhCn),
+            (r#""zh-TW""#, LanguagePreference::ZhTw),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<LanguagePreference>(json).unwrap(),
+                expected
+            );
+        }
     }
 }
