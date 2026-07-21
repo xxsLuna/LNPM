@@ -606,6 +606,7 @@ select:focus-visible {
 }
 
 .chart-host {
+  position: relative;
   width: 100%;
   min-height: 0;
   flex: 1;
@@ -1265,6 +1266,7 @@ select:focus-visible {
 }
 
 .popup-chart {
+  position: relative;
   min-height: 0;
   flex: 1;
   overflow: hidden;
@@ -1312,7 +1314,7 @@ select:focus-visible {
 }
 
 .chart-tooltip {
-  position: fixed;
+  position: absolute;
   z-index: 50;
   min-width: 138px;
   max-width: 240px;

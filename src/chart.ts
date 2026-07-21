@@ -1,6 +1,7 @@
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
+import { calculateTooltipPosition } from "./chart-tooltip";
 import { formatDateTime, formatLatency, stateLabel } from "./i18n";
 import type { HistoryResponse, QualityIntervalRecord } from "./types";
 
@@ -156,8 +157,21 @@ export class LatencyChart {
       ? `<div class="tooltip-state state-${interval.state}">${stateLabel(interval.state)}</div>`
       : "";
     this.tooltip.innerHTML = `<time>${formatDateTime(timestampMs)}</time>${values}${intervalText}`;
-    this.tooltip.style.left = `${Math.min((plot.cursor.left ?? 0) + 14, this.container.clientWidth - 190)}px`;
-    this.tooltip.style.top = `${Math.max(8, (plot.cursor.top ?? 0) - 30)}px`;
+    const containerRect = this.container.getBoundingClientRect();
+    const overlayRect = plot.over.getBoundingClientRect();
+    const anchorX = overlayRect.left - containerRect.left + plot.cursor.left;
+    const anchorY =
+      overlayRect.top - containerRect.top + (plot.cursor.top ?? overlayRect.height / 2);
+    const position = calculateTooltipPosition({
+      anchorX,
+      anchorY,
+      tooltipWidth: this.tooltip.offsetWidth,
+      tooltipHeight: this.tooltip.offsetHeight,
+      containerWidth: this.container.clientWidth,
+      containerHeight: this.container.clientHeight,
+    });
+    this.tooltip.style.left = `${position.left}px`;
+    this.tooltip.style.top = `${position.top}px`;
     this.tooltip.classList.add("visible");
   }
 
