@@ -110,11 +110,17 @@ async function bootstrap(): Promise<void> {
     window.setTimeout(() => location.reload(), 50);
   });
   // Result of a check the user started from the tray. It has to say something either way, or the
-  // menu item looks broken when the app is already up to date.
-  await listen<"checking" | "upToDate" | "failed">("update-check", (event) => {
-    if (event.payload === "checking") showToast(t("update.checking"), "info");
-    else if (event.payload === "upToDate") showToast(t("update.upToDate"), "success");
-    else showToast(formatError({ code: "updateCheck", detail: null }), "error");
+  // menu item looks broken when the app is already up to date — and the "checking" toast is
+  // replaced rather than stacked, so the two never sit on screen together.
+  await listen<"checking" | "upToDate" | "failed" | "busy">("update-check", (event) => {
+    if (event.payload === "checking") {
+      replaceCheckToast(t("update.checking"), "info");
+      return;
+    }
+    if (event.payload === "upToDate") replaceCheckToast(t("update.upToDate"), "success");
+    else if (event.payload === "busy") {
+      replaceCheckToast(formatError({ code: "updateBusy", detail: null }), "error");
+    } else replaceCheckToast(formatError({ code: "updateCheck", detail: null }), "error");
   });
   await listen<UpdateInfo>("update-available", (event) => {
     void showAvailableUpdate(event.payload);
@@ -846,6 +852,9 @@ function schedulePopupHide(): void {
 }
 
 async function showAvailableUpdate(info: UpdateInfo): Promise<void> {
+  // The dialog answers the manual check, so its progress toast has served its purpose.
+  checkToast?.remove();
+  checkToast = null;
   updateUiState = reduceUpdateUiState(updateUiState, { type: "available", payload: info });
   if (isPopup) return;
   currentAppVersion ??= await getVersion();
@@ -1044,6 +1053,14 @@ function aggregateState(): QualityState {
   );
 }
 
+let checkToast: HTMLDivElement | null = null;
+
+/** Shows the update-check status, retiring the previous one so a result never stacks on "checking". */
+function replaceCheckToast(message: string, kind: string): void {
+  checkToast?.remove();
+  checkToast = showToast(message, kind);
+}
+
 const recentToasts = new Map<string, number>();
 
 /** Shows a toast at most once every ten seconds per key, for repeating background failures. */
@@ -1055,9 +1072,9 @@ function showToastOnce(key: string, message: string, kind = "error"): void {
   showToast(message, kind);
 }
 
-function showToast(message: string, kind: string): void {
+function showToast(message: string, kind: string): HTMLDivElement | null {
   const stack = document.querySelector<HTMLDivElement>("#toast-stack");
-  if (!stack) return;
+  if (!stack) return null;
   const toast = document.createElement("div");
   toast.className = `toast toast-${kind}`;
   toast.textContent = message;
@@ -1067,6 +1084,7 @@ function showToast(message: string, kind: string): void {
     toast.classList.remove("visible");
     window.setTimeout(() => toast.remove(), 240);
   }, 4_500);
+  return toast;
 }
 
 function byId<T extends HTMLElement = HTMLElement>(id: string): T {
