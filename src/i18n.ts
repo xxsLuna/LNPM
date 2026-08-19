@@ -22,6 +22,7 @@ const catalogs: Record<Language, Catalog> = {
 
 const errorKeys: Record<string, MessageKey> = {
   unknown: "error.unknown",
+  nameRequired: "error.nameRequired",
   hostRequired: "error.hostRequired",
   invalidHost: "error.invalidHost",
   intervalRange: "error.intervalRange",

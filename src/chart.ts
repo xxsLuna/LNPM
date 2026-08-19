@@ -2,10 +2,13 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
 import { calculateTooltipPosition } from "./chart-tooltip";
-import { formatDateTime, formatLatency, stateLabel } from "./i18n";
+import { formatDateTime, formatLatency, getLanguage, stateLabel } from "./i18n";
 import type { HistoryResponse, QualityIntervalRecord } from "./types";
 
 const palette = ["#5eead4", "#60a5fa", "#c084fc", "#f472b6", "#facc15"];
+
+/** An interval plus the monitor it belongs to, so the tooltip can name it. */
+type DisplayInterval = QualityIntervalRecord & { targetName: string };
 
 interface ChartOptions {
   compact?: boolean;
@@ -19,6 +22,12 @@ export class LatencyChart {
   private tooltip: HTMLDivElement;
   private history: HistoryResponse | null = null;
   private selectedTargetId: string | null;
+  private labels: string[] = [];
+  private intervals: DisplayInterval[] = [];
+  /** Identifies the plot layout, so a refresh only rebuilds when the layout really changed. */
+  private layout = "";
+  private panning = false;
+  private zoomTimer = 0;
 
   constructor(
     private readonly container: HTMLElement,
@@ -30,17 +39,37 @@ export class LatencyChart {
     this.container.append(this.tooltip);
   }
 
+  /** True while the user is dragging or has a wheel zoom settling, so live refreshes can hold off. */
+  isInteracting(): boolean {
+    return this.panning || this.zoomTimer !== 0;
+  }
+
   render(history: HistoryResponse, selectedTargetId = this.selectedTargetId): void {
     this.history = history;
     this.selectedTargetId = selectedTargetId ?? null;
+
+    const { data, labels } = alignSeries(history);
+    this.labels = labels;
+    this.intervals = this.intervalsForDisplay(history);
+
+    const layout = [
+      this.selectedTargetId ?? "",
+      ...history.series.map((item) => `${item.target.id}:${item.target.name}`),
+    ].join("|");
+    if (this.plot && layout === this.layout) {
+      // Same monitors and same selection: feed the new samples to the existing plot rather than
+      // building a new one, which would cancel a pan and drop the tooltip.
+      this.plot.setData(data, false);
+      this.plot.setScale("x", { min: history.fromMs / 1_000, max: history.toMs / 1_000 });
+      return;
+    }
+    this.layout = layout;
     this.plot?.destroy();
     this.resizeObserver?.disconnect();
     this.container.querySelector(".uplot")?.remove();
 
-    const { data, labels } = alignSeries(history);
     const width = Math.max(280, this.container.clientWidth);
     const height = Math.max(this.options.compact ? 80 : 260, this.container.clientHeight);
-    const intervals = this.intervalsForDisplay(history);
 
     const series: uPlot.Series[] = [
       { label: "Time" },
@@ -76,6 +105,13 @@ export class LatencyChart {
             {
               stroke: "#7f8da3",
               grid: { stroke: "rgba(148, 163, 184, 0.10)", width: 1 },
+              // Every other date in the app goes through Intl; uPlot's built-in ticks would stay
+              // English with am/pm in every language. The format follows the tick spacing so that
+              // neighbouring labels never come out identical.
+              values: (_u, splits, _axisIdx, _foundSpace, foundIncr) => {
+                const format = new Intl.DateTimeFormat(getLanguage(), tickFormat(foundIncr));
+                return splits.map((seconds) => format.format(new Date(seconds * 1_000)));
+              },
             },
             {
               stroke: "#7f8da3",
@@ -90,13 +126,15 @@ export class LatencyChart {
       },
       legend: { show: false },
       hooks: {
-        drawClear: [(u) => drawIntervals(u, intervals, history.toMs)],
-        setCursor: [(u) => this.updateTooltip(u, labels, intervals)],
+        // Read through `this` so that a data-only refresh keeps drawing the current intervals.
+        drawClear: [(u) => drawIntervals(u, this.intervals, this.history?.toMs ?? 0)],
+        setCursor: [(u) => this.updateTooltip(u)],
         ready: [(u) => this.attachInteractions(u)],
       },
     };
 
     this.plot = new uPlot(plotOptions, data, this.container);
+    this.plot.setScale("x", { min: history.fromMs / 1_000, max: history.toMs / 1_000 });
     this.resizeObserver = new ResizeObserver(() => {
       if (!this.plot) return;
       const nextWidth = Math.max(280, this.container.clientWidth);
@@ -113,29 +151,29 @@ export class LatencyChart {
 
   destroy(): void {
     this.resizeObserver?.disconnect();
+    window.clearTimeout(this.zoomTimer);
+    this.zoomTimer = 0;
     this.plot?.destroy();
     this.plot = null;
+    this.layout = "";
     this.tooltip.remove();
   }
 
-  private intervalsForDisplay(history: HistoryResponse): QualityIntervalRecord[] {
-    if (this.options.compact) {
-      return history.series.flatMap((series) => series.intervals);
+  private intervalsForDisplay(history: HistoryResponse): DisplayInterval[] {
+    const withNames = (series: HistoryResponse["series"]): DisplayInterval[] =>
+      series.flatMap((item) =>
+        item.intervals.map((interval) => ({ ...interval, targetName: item.target.name })),
+      );
+    if (this.options.compact || this.selectedTargetId === null) {
+      return withNames(history.series);
     }
-    if (this.selectedTargetId === null) {
-      return history.series.flatMap((series) => series.intervals);
-    }
-    const selected =
-      history.series.find((series) => series.target.id === this.selectedTargetId) ??
-      history.series[0];
-    return selected?.intervals ?? [];
+    const selected = history.series.filter((series) => series.target.id === this.selectedTargetId);
+    return withNames(selected.length > 0 ? selected : history.series.slice(0, 1));
   }
 
-  private updateTooltip(
-    plot: uPlot,
-    labels: string[],
-    intervals: QualityIntervalRecord[],
-  ): void {
+  private updateTooltip(plot: uPlot): void {
+    const labels = this.labels;
+    const intervals = this.intervals;
     const index = plot.cursor.idx;
     if (index == null || plot.cursor.left == null || !this.history) {
       this.tooltip.classList.remove("visible");
@@ -153,11 +191,19 @@ export class LatencyChart {
       })
       .filter(Boolean)
       .join("");
-    const interval = intervals.find(
-      (item) => timestampMs >= item.startMs && timestampMs <= (item.endMs ?? this.history!.toMs),
-    );
+    // Intervals are half-open, so the end bound must be exclusive or the instant where one interval
+    // ends matches both it and its successor. With several monitors on screen, report the worst
+    // state covering the instant and name its monitor instead of whichever one happened to be first.
+    const covering = intervals
+      .filter((item) => timestampMs >= item.startMs && timestampMs < (item.endMs ?? this.history!.toMs))
+      .sort((first, second) => intervalPriority(second) - intervalPriority(first));
+    const interval = covering[0];
     const intervalText = interval
-      ? `<div class="tooltip-state state-${interval.state}">${stateLabel(interval.state)}</div>`
+      ? `<div class="tooltip-state state-${interval.state}">${
+          this.selectedTargetId === null && !this.options.compact
+            ? `${escapeHtml(interval.targetName)} · `
+            : ""
+        }${stateLabel(interval.state)}</div>`
       : "";
     this.tooltip.innerHTML = `<time>${formatDateTime(timestampMs)}</time>${values}${intervalText}`;
     const containerRect = this.container.getBoundingClientRect();
@@ -189,6 +235,7 @@ export class LatencyChart {
     overlay.addEventListener("pointerdown", (event) => {
       if (event.button !== 0 || plot.scales.x.min == null || plot.scales.x.max == null) return;
       dragging = true;
+      this.panning = true;
       startX = event.clientX;
       startMin = plot.scales.x.min;
       startMax = plot.scales.x.max;
@@ -197,13 +244,16 @@ export class LatencyChart {
     });
     overlay.addEventListener("pointermove", (event) => {
       if (!dragging) return;
+      // Pointer coordinates are CSS pixels while `plot.bbox` is in device pixels, so on any display
+      // with a scale factor other than 100% the content used to move by the wrong amount.
       const deltaSeconds =
-        ((event.clientX - startX) / Math.max(1, plot.bbox.width)) * (startMax - startMin);
+        ((event.clientX - startX) / Math.max(1, overlay.clientWidth)) * (startMax - startMin);
       plot.setScale("x", { min: startMin - deltaSeconds, max: startMax - deltaSeconds });
     });
     const finishPan = (event: PointerEvent) => {
       if (!dragging) return;
       dragging = false;
+      this.panning = false;
       overlay.releasePointerCapture(event.pointerId);
       overlay.classList.remove("is-panning");
       this.reportRange(plot);
@@ -217,18 +267,23 @@ export class LatencyChart {
         event.preventDefault();
         const range = plot.scales.x.max - plot.scales.x.min;
         const factor = event.deltaY > 0 ? 1.25 : 0.8;
-        const cursorRatio = Math.max(0, Math.min(1, event.offsetX / Math.max(1, plot.bbox.width)));
+        const cursorRatio = Math.max(
+          0,
+          Math.min(1, event.offsetX / Math.max(1, overlay.clientWidth)),
+        );
         const anchor = plot.scales.x.min + range * cursorRatio;
         const nextRange = Math.max(60, Math.min(365 * 86_400, range * factor));
         plot.setScale("x", {
           min: anchor - nextRange * cursorRatio,
           max: anchor + nextRange * (1 - cursorRatio),
         });
-        window.clearTimeout((overlay as HTMLElement & { zoomTimer?: number }).zoomTimer);
-        (overlay as HTMLElement & { zoomTimer?: number }).zoomTimer = window.setTimeout(
-          () => this.reportRange(plot),
-          180,
-        );
+        // Kept on the instance so `destroy` can cancel it; a pending timer used to fire on a
+        // destroyed plot and re-request the range it had been showing.
+        window.clearTimeout(this.zoomTimer);
+        this.zoomTimer = window.setTimeout(() => {
+          this.zoomTimer = 0;
+          if (this.plot === plot) this.reportRange(plot);
+        }, 180);
       },
       { passive: false },
     );
@@ -239,6 +294,15 @@ export class LatencyChart {
     const max = plot.scales.x.max;
     if (min != null && max != null) this.options.onRangeChanged?.(min * 1_000, max * 1_000);
   }
+}
+
+/** Picks the smallest date format that still tells two neighbouring ticks apart. */
+function tickFormat(incrementSeconds: number): Intl.DateTimeFormatOptions {
+  if (incrementSeconds >= 30 * 86_400) return { year: "numeric", month: "short" };
+  if (incrementSeconds >= 86_400) return { month: "short", day: "numeric" };
+  if (incrementSeconds >= 3_600) return { month: "numeric", day: "numeric", hour: "numeric" };
+  if (incrementSeconds >= 60) return { hour: "numeric", minute: "2-digit" };
+  return { hour: "numeric", minute: "2-digit", second: "2-digit" };
 }
 
 function alignSeries(history: HistoryResponse): {
@@ -261,7 +325,7 @@ function alignSeries(history: HistoryResponse): {
 
 function drawIntervals(
   plot: uPlot,
-  intervals: QualityIntervalRecord[],
+  intervals: readonly QualityIntervalRecord[],
   fallbackEndMs: number,
 ): void {
   const drawable = intervals

@@ -16,10 +16,28 @@ export function aggregateRangeSummary(
   const sampleCount = sum(summaries.map((summary) => summary.sampleCount));
   const successCount = sum(summaries.map((summary) => summary.successCount));
   const failureCount = sum(summaries.map((summary) => summary.failureCount));
-  const stableMs = sum(summaries.map((summary) => summary.stableMs));
-  const unstableMs = sum(summaries.map((summary) => summary.unstableMs));
-  const disconnectedMs = sum(summaries.map((summary) => summary.disconnectedMs));
-  const observedMs = stableMs + unstableMs + disconnectedMs;
+  // Summing monitor-time would let a ten-minute range report thirty minutes of trouble, and
+  // averaging it would hide a single monitor's outage behind its healthy peers. Each time metric
+  // therefore reports the monitor that was worst for that metric — the same "worst of the fleet"
+  // convention the P95 card uses — so every number stays inside the selected range and its label is
+  // true of the monitor it came from.
+  const observedMs = (summary: RangeSummary): number =>
+    summary.stableMs + summary.unstableMs + summary.disconnectedMs;
+  // Ranked by the share the card actually shows, with the absolute time as the tie-break so a
+  // monitor that was only observed for a moment cannot outrank one that was down for an hour.
+  const worstBy = (metric: (summary: RangeSummary) => number): RangeSummary =>
+    summaries.reduce((candidate, summary) => {
+      const share = observedMs(summary) === 0 ? 0 : metric(summary) / observedMs(summary);
+      const leader = observedMs(candidate) === 0 ? 0 : metric(candidate) / observedMs(candidate);
+      if (share !== leader) return share > leader ? summary : candidate;
+      return metric(summary) > metric(candidate) ? summary : candidate;
+    });
+  const worstUnstable = worstBy((summary) => summary.unstableMs);
+  const worstDisconnected = worstBy((summary) => summary.disconnectedMs);
+  // "Worst" for stability means the monitor that spent the most time in trouble, not the one with
+  // the most stable time — that would be the best of the fleet. The three percentages therefore have
+  // three different denominators, one per reported monitor.
+  const worstStable = worstBy((summary) => summary.unstableMs + summary.disconnectedMs);
 
   return {
     sampleCount,
@@ -34,12 +52,15 @@ export function aggregateRangeSummary(
     // The exact combined P95 requires raw samples. The highest per-monitor P95
     // is deterministic and surfaces the worst monitored path in the overview.
     p95LatencyMs: maximum(summaries.map((summary) => summary.p95LatencyMs)),
-    stableMs,
-    unstableMs,
-    disconnectedMs,
-    stablePercent: percentage(stableMs, observedMs),
-    unstablePercent: percentage(unstableMs, observedMs),
-    disconnectedPercent: percentage(disconnectedMs, observedMs),
+    stableMs: worstStable.stableMs,
+    unstableMs: worstUnstable.unstableMs,
+    disconnectedMs: worstDisconnected.disconnectedMs,
+    stablePercent: percentage(worstStable.stableMs, observedMs(worstStable)),
+    unstablePercent: percentage(worstUnstable.unstableMs, observedMs(worstUnstable)),
+    disconnectedPercent: percentage(
+      worstDisconnected.disconnectedMs,
+      observedMs(worstDisconnected),
+    ),
   };
 }
 
