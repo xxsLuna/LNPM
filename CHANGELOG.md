@@ -8,8 +8,6 @@ All notable changes to LNPM are documented in this file.
 
 - A tray menu item that checks for updates on demand. It reports what happened either way — through the window when it is on screen and through a notification when it is not — and it overrides a deferral or a skip of the version it finds, because asking to check means asking to see what is available.
 
-## 0.3.0 - 2026-08-19
-
 ### Fixed
 
 - The setup dialog no longer appears on an installation that already has monitors. Both windows used to start before the backend had registered its state, so the first query could be rejected and an empty answer was treated as a fresh install; the windows are now created once the state exists, the frontend retries and reports a failure instead of assuming, and the dialog is reserved for a genuinely first run.
