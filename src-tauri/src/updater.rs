@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 use crate::{
     commands::CommandError,
     domain::{AppSettings, unix_time_ms},
-    i18n::{active_language, message},
+    i18n::{active_language, message, text},
     storage::Database,
 };
 
@@ -76,6 +76,24 @@ enum PromptDecision {
     Prompt,
     Defer(Duration),
     Skip,
+}
+
+/// What a user-requested check has to say for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckReport {
+    Checking,
+    UpToDate,
+    Failed,
+}
+
+impl CheckReport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Checking => "checking",
+            Self::UpToDate => "upToDate",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,18 +255,86 @@ impl UpdateManager {
         }
     }
 
+    /// Runs a check because the user asked for one from the tray, and reports the outcome either
+    /// way — a check that says nothing is indistinguishable from a broken menu item.
+    ///
+    /// Unlike the scheduler, this ignores a deferral or a skip of the version it finds: the user is
+    /// asking to see what is available right now, so the stored postponement is cleared and the
+    /// update is offered again.
+    pub async fn check_manually(&self) {
+        self.report_check(CheckReport::Checking);
+        let outcome = self.check_once().await;
+        let pending = self.inner.pending.lock().as_ref().map(UpdateInfo::from);
+        match (outcome, pending) {
+            (CheckOutcome::AlreadyRunning, None) => {}
+            (_, Some(info)) => {
+                let database = self.inner.database.clone();
+                let version = info.version.clone();
+                let cleared = tauri::async_runtime::spawn_blocking(move || {
+                    database.update_settings(|settings| {
+                        if settings.update_deferred_version.as_deref() == Some(version.as_str()) {
+                            settings.update_deferred_version = None;
+                            settings.update_deferred_until_ms = None;
+                        }
+                        if settings.skipped_update_version.as_deref() == Some(version.as_str()) {
+                            settings.skipped_update_version = None;
+                        }
+                    })
+                })
+                .await;
+                if let Ok(Ok(settings)) = cleared {
+                    let _ = self.inner.app.emit("settings-updated", &settings);
+                }
+                // Announce even if this exact version was announced before: the request came from
+                // the user, so silence would look like nothing happened.
+                *self.inner.announced_version.lock() = None;
+                self.announce_update(&info);
+                crate::tray::show_main_window(&self.inner.app);
+                self.inner.wake.notify_waiters();
+            }
+            (CheckOutcome::Failed, None) => self.report_check(CheckReport::Failed),
+            (_, None) => self.report_check(CheckReport::UpToDate),
+        }
+    }
+
+    /// Tells the user how a manual check went, through the window if it is on screen and through a
+    /// notification if it is not.
+    fn report_check(&self, report: CheckReport) {
+        let _ = self.inner.app.emit("update-check", report.as_str());
+        if matches!(report, CheckReport::Checking) || self.main_window_is_visible() {
+            return;
+        }
+        let settings = self.inner.database.load_settings().unwrap_or_default();
+        let language = active_language(settings.language);
+        let body = match report {
+            CheckReport::UpToDate => text(language, "update.upToDate"),
+            CheckReport::Failed => text(language, "error.updateCheck"),
+            CheckReport::Checking => return,
+        };
+        let _ = self
+            .inner
+            .app
+            .notification()
+            .builder()
+            .title("LNPM")
+            .body(body)
+            .show();
+    }
+
+    fn main_window_is_visible(&self) -> bool {
+        self.inner
+            .app
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false)
+    }
+
     fn announce_update(&self, info: &UpdateInfo) {
         if !mark_announced(&mut self.inner.announced_version.lock(), &info.version) {
             return;
         }
         let _ = self.inner.app.emit("update-available", info);
-        let main_is_visible = self
-            .inner
-            .app
-            .get_webview_window("main")
-            .and_then(|window| window.is_visible().ok())
-            .unwrap_or(false);
-        if main_is_visible {
+        if self.main_window_is_visible() {
             return;
         }
         let settings = self.inner.database.load_settings().unwrap_or_default();
