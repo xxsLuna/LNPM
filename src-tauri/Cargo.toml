@@ -1,6 +1,6 @@
 [package]
 name = "lnpm"
-version = "0.2.1"
+version = "0.3.0"
 description = "Cross-platform live ICMP latency and network stability monitor"
 authors = ["xxsLuna"]
 license = "MIT"
