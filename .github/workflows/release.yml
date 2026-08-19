@@ -74,16 +74,19 @@ jobs:
 
           Project administrator: [@xxsLuna](https://github.com/xxsLuna)
           FOOTER
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "LNPM $GITHUB_REF_NAME" --notes-file notes.md --draft
+          # A draft is not addressable by tag, so an existing one has to be found in the list — but
+          # a release created moments ago does not appear there yet, so a new one takes its id from
+          # the creation response instead of from a follow-up query.
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq "[.[] | select(.tag_name == \"$GITHUB_REF_NAME\")] | first | .id // empty")"
+          if [ -n "$release_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f name="LNPM $GITHUB_REF_NAME" -F body=@notes.md -F draft=true --jq .id
           else
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "LNPM $GITHUB_REF_NAME" --notes-file notes.md --draft
+            release_id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$GITHUB_REF_NAME" -f name="LNPM $GITHUB_REF_NAME" \
+              -F body=@notes.md -F draft=true -F prerelease=false --jq .id)"
           fi
-          # Drafts are not addressable by tag through the API, so resolve the id from the list.
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases" \
-            --jq "[.[] | select(.tag_name == \"$GITHUB_REF_NAME\")] | first | .id")"
           test -n "$release_id"
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
