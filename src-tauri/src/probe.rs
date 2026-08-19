@@ -58,7 +58,15 @@ impl SurgePingProbe {
 impl PingProbe for SurgePingProbe {
     async fn probe(&self, target: &Target) -> PingSample {
         let timestamp_ms = unix_time_ms();
-        let address = match self.resolve(target).await {
+        // Name resolution has to be bounded too: an unanswered DNS query used to hang the probe far
+        // past `timeout_ms`, which starved the sampling loop exactly when an outage began.
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(target.timeout_ms),
+            self.resolve(target),
+        )
+        .await
+        .unwrap_or_else(|_| Err("Name resolution timed out".into()));
+        let address = match resolved {
             Ok(address) => address,
             Err(error) => {
                 let mut sample =

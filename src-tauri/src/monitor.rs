@@ -73,6 +73,9 @@ pub struct MonitorService {
     event_sink: Arc<dyn MonitorEventSink>,
     runtimes: RwLock<HashMap<String, TargetRuntime>>,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Serialises the multi-step target mutations. Commands run on worker threads, so two saves of
+    /// the same target could otherwise interleave their archive/save/install steps.
+    mutations: Mutex<()>,
     paused: AtomicBool,
     shutting_down: AtomicBool,
 }
@@ -89,6 +92,7 @@ impl MonitorService {
             event_sink,
             runtimes: RwLock::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
+            mutations: Mutex::new(()),
             paused: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         })
@@ -122,10 +126,11 @@ impl MonitorService {
 
     pub fn upsert_target(self: &Arc<Self>, mut target: Target) -> Result<Target, MonitorError> {
         target.validate()?;
+        let _mutation = self.mutations.lock();
         if let Some(existing) = self.database.get_target(&target.id)? {
             if existing.host != target.host || existing.address_family != target.address_family {
                 let now_ms = unix_time_ms();
-                self.archive_target(&existing.id)?;
+                self.archive_target_locked(&existing.id)?;
                 let mut replacement = Target::new(target.name.clone(), target.host.clone());
                 replacement.enabled = target.enabled;
                 replacement.address_family = target.address_family;
@@ -153,6 +158,12 @@ impl MonitorService {
     }
 
     pub fn archive_target(&self, target_id: &str) -> Result<(), MonitorError> {
+        let _mutation = self.mutations.lock();
+        self.archive_target_locked(target_id)
+    }
+
+    /// Body of [`Self::archive_target`], for callers that already hold the mutation lock.
+    fn archive_target_locked(&self, target_id: &str) -> Result<(), MonitorError> {
         if self.database.get_target(target_id)?.is_none() {
             return Err(MonitorError::TargetNotFound(target_id.into()));
         }
@@ -163,15 +174,39 @@ impl MonitorService {
         Ok(())
     }
 
+    /// Flips the global pause in one step. Reading the current value in the caller and writing it
+    /// here would drop a second click that arrives before the first one has been applied.
+    pub fn toggle_paused(&self) {
+        self.apply_paused(!self.paused.load(Ordering::SeqCst));
+    }
+
     pub fn set_paused(&self, paused: bool) {
+        self.apply_paused(paused);
+    }
+
+    fn apply_paused(&self, paused: bool) {
         if self.paused.swap(paused, Ordering::SeqCst) == paused {
             return;
         }
         let now_ms = unix_time_ms();
+        if paused {
+            // Nothing will be observed until monitoring resumes, so the intervals have to be closed
+            // here; otherwise the paused time is later reported as uptime.
+            if let Err(error) = self.database.close_open_intervals(now_ms) {
+                self.event_sink.monitor_error(
+                    None,
+                    "storage",
+                    &format!("failed to close intervals: {error}"),
+                );
+            }
+        }
         let mut transitions = Vec::new();
         {
             let mut runtimes = self.runtimes.write();
             for runtime in runtimes.values_mut() {
+                // A disabled target is not observed even while monitoring is running, so resuming
+                // must leave it paused instead of warming up forever.
+                let paused = paused || !runtime.status.target.enabled;
                 if let Some(transition) = runtime.classifier.set_paused(paused, now_ms) {
                     runtime.status.state = transition.to;
                     runtime.status.state_since_ms = transition.effective_at_ms;
@@ -219,10 +254,27 @@ impl MonitorService {
         } else {
             QualityState::Paused
         };
+        if !target.enabled {
+            // Stop attributing time to the last observed state while the target is switched off.
+            if let Err(error) = self
+                .database
+                .close_open_intervals_for(&target.id, unix_time_ms())
+            {
+                self.event_sink.monitor_error(
+                    Some(&target.id),
+                    "storage",
+                    &format!("failed to close intervals: {error}"),
+                );
+            }
+        }
         self.runtimes.write().insert(
             target.id.clone(),
             TargetRuntime {
-                classifier: QualityClassifier::new(target.thresholds.clone(), unix_time_ms()),
+                classifier: QualityClassifier::new(
+                    target.thresholds.clone(),
+                    target.interval_ms,
+                    unix_time_ms(),
+                ),
                 status: LiveTargetStatus {
                     target: target.clone(),
                     state,
@@ -244,7 +296,11 @@ impl MonitorService {
         let task = tauri::async_runtime::spawn(async move {
             run_target_loop(weak, task_target_id).await;
         });
-        self.tasks.lock().insert(target_id, task);
+        // Dropping a JoinHandle detaches the task instead of cancelling it, so a displaced loop has
+        // to be aborted explicitly or the target would be probed twice.
+        if let Some(previous) = self.tasks.lock().insert(target_id, task) {
+            previous.abort();
+        }
     }
 
     fn stop_target(&self, target_id: &str) {
@@ -280,12 +336,13 @@ impl MonitorService {
         let persisted_sample = sample.clone();
         let persisted_update = update.clone();
         let interval_ms = target.interval_ms;
-        tauri::async_runtime::spawn_blocking(move || {
+        let write_result = tauri::async_runtime::spawn_blocking(move || {
             database.write_sample(&persisted_sample, &persisted_update, interval_ms)
         })
-        .await
-        .map_err(|error| StorageError::InvalidData(error.to_string()))??;
+        .await;
 
+        // The live dashboard and a state change the user needs to see must not be lost just because
+        // this one sample could not be persisted; the write error is still reported below.
         self.event_sink.dashboard_updated(snapshot);
         if let Some(transition) = update.transition {
             self.event_sink.quality_transition(QualityTransitionEvent {
@@ -293,6 +350,11 @@ impl MonitorService {
                 transition,
                 metrics: update.metrics,
             });
+        }
+
+        match write_result {
+            Ok(result) => result?,
+            Err(error) => return Err(StorageError::InvalidData(error.to_string()).into()),
         }
         Ok(())
     }

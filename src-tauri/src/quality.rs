@@ -5,8 +5,14 @@ use crate::domain::{
     QualityThresholds, StateTransition,
 };
 
+/// A gap this much larger than the probe interval means the target was not being observed at all
+/// (system suspend, a stalled network stack, a probe task that was aborted), so the samples still
+/// in the window and the pending candidate timers say nothing about the time that passed.
+const MINIMUM_GAP_MS: i64 = 30_000;
+
 pub struct QualityClassifier {
     thresholds: QualityThresholds,
+    gap_ms: i64,
     window: VecDeque<PingSample>,
     state: QualityState,
     state_since_ms: i64,
@@ -19,9 +25,15 @@ pub struct QualityClassifier {
 }
 
 impl QualityClassifier {
-    pub fn new(thresholds: QualityThresholds, now_ms: i64) -> Self {
+    pub fn new(mut thresholds: QualityThresholds, interval_ms: u64, now_ms: i64) -> Self {
+        // The window is pruned by wall clock, so it can never hold more than the number of samples
+        // the interval fits into `window_seconds`. Asking for more than that (the default asks for
+        // 10, which a 7 s interval can never reach) would keep the target in `WarmingUp` forever.
+        let capacity = (thresholds.window_seconds * 1_000 / interval_ms.max(1)) as usize + 1;
+        thresholds.minimum_samples = thresholds.minimum_samples.clamp(1, capacity.max(1));
         Self {
             thresholds,
+            gap_ms: (interval_ms as i64 * 5).max(MINIMUM_GAP_MS),
             window: VecDeque::new(),
             state: QualityState::WarmingUp,
             state_since_ms: now_ms,
@@ -36,12 +48,25 @@ impl QualityClassifier {
 
     pub fn observe(&mut self, sample: PingSample) -> ClassificationUpdate {
         let now_ms = sample.timestamp_ms;
+        if let Some(gap_started_ms) = self.monitoring_gap_before(now_ms) {
+            let transition = self.begin_unobserved(gap_started_ms);
+            self.window.push_back(sample.clone());
+            self.update_streaks(&sample);
+            let metrics = calculate_metrics(&self.window);
+            return ClassificationUpdate {
+                state: self.state,
+                state_since_ms: self.state_since_ms,
+                metrics,
+                reasons: Vec::new(),
+                transition,
+            };
+        }
         self.window.push_back(sample.clone());
         self.prune_window(now_ms);
         self.update_streaks(&sample);
 
         let metrics = calculate_metrics(&self.window);
-        let reasons = self.instability_reasons(&metrics);
+        let mut reasons = self.instability_reasons(&metrics);
         let mut transition = None;
 
         if sample.status.counts_as_network_failure()
@@ -62,11 +87,20 @@ impl QualityClassifier {
             {
                 let effective_at_ms = self.success_streak_since_ms.unwrap_or(now_ms);
                 transition = self.transition_to(QualityState::Stable, effective_at_ms, vec![]);
+                // The outage's failures say nothing about the link now that it answers again, and
+                // leaving them in the window would report the recovered target as unstable for the
+                // next minute. Start a fresh window from the sample that confirmed the recovery.
+                self.window.clear();
+                self.window.push_back(sample.clone());
+                reasons.clear();
                 self.unstable_candidate_since_ms = None;
                 self.stable_candidate_since_ms = None;
             }
         } else if self.window.len() >= self.thresholds.minimum_samples {
-            if self.state == QualityState::WarmingUp {
+            if matches!(
+                self.state,
+                QualityState::WarmingUp | QualityState::Unobserved
+            ) {
                 transition = self.transition_to(QualityState::Stable, now_ms, vec![]);
             }
 
@@ -124,6 +158,24 @@ impl QualityClassifier {
             QualityState::WarmingUp
         };
         self.transition_to(next, timestamp_ms, vec![])
+    }
+
+    /// Returns when observation stopped if the sample about to be observed follows a gap that is
+    /// too long to be explained by the probe interval.
+    fn monitoring_gap_before(&self, now_ms: i64) -> Option<i64> {
+        let last_ms = self.window.back()?.timestamp_ms;
+        (now_ms.saturating_sub(last_ms) > self.gap_ms).then_some(last_ms)
+    }
+
+    fn begin_unobserved(&mut self, gap_started_ms: i64) -> Option<StateTransition> {
+        self.window.clear();
+        self.failure_streak = 0;
+        self.success_streak = 0;
+        self.failure_streak_since_ms = None;
+        self.success_streak_since_ms = None;
+        self.unstable_candidate_since_ms = None;
+        self.stable_candidate_since_ms = None;
+        self.transition_to(QualityState::Unobserved, gap_started_ms, vec![])
     }
 
     fn prune_window(&mut self, now_ms: i64) {
@@ -265,7 +317,7 @@ mod tests {
     use crate::domain::{PingSample, ProbeStatus, QualityThresholds};
 
     fn classifier() -> QualityClassifier {
-        QualityClassifier::new(QualityThresholds::default(), 0)
+        QualityClassifier::new(QualityThresholds::default(), 1_000, 0)
     }
 
     #[test]
@@ -303,6 +355,22 @@ mod tests {
         let update = last.unwrap();
         assert_eq!(update.state, QualityState::Stable);
         assert_eq!(update.transition.unwrap().effective_at_ms, 6_000);
+        assert!(update.reasons.is_empty());
+
+        // The failures that made up the outage must not be counted against the recovered link: the
+        // window restarts, so the target stays stable instead of flipping to unstable for a minute.
+        let mut states = Vec::new();
+        for second in 9..=40 {
+            states.push(
+                classifier
+                    .observe(PingSample::success("target", second * 1_000, 20.0))
+                    .state,
+            );
+        }
+        assert!(
+            states.iter().all(|state| *state == QualityState::Stable),
+            "expected the recovered target to stay stable, saw {states:?}"
+        );
     }
 
     #[test]
@@ -336,6 +404,50 @@ mod tests {
         assert_eq!(metrics.average_latency_ms, Some(70.0 / 3.0));
         assert_eq!(metrics.p95_latency_ms, Some(40.0));
         assert_eq!(metrics.jitter_ms, Some(15.0));
+    }
+
+    #[test]
+    fn a_slow_interval_still_leaves_warming_up() {
+        let thresholds = QualityThresholds {
+            window_seconds: 60,
+            minimum_samples: 10,
+            ..QualityThresholds::default()
+        };
+        // 10 samples never fit in a 60 s window at one sample every 10 s.
+        let mut classifier = QualityClassifier::new(thresholds, 10_000, 0);
+        let mut states = Vec::new();
+        for step in 1..=8_i64 {
+            states.push(
+                classifier
+                    .observe(PingSample::success("target", step * 10_000, 20.0))
+                    .state,
+            );
+        }
+        assert!(
+            states.contains(&QualityState::Stable),
+            "expected the target to leave WarmingUp, saw {states:?}"
+        );
+    }
+
+    #[test]
+    fn a_monitoring_gap_is_recorded_as_unobserved_and_then_warms_up_again() {
+        let mut classifier = classifier();
+        for second in 1..=12 {
+            classifier.observe(PingSample::success("target", second * 1_000, 20.0));
+        }
+
+        // The machine was asleep for an hour.
+        let resumed = classifier.observe(PingSample::success("target", 3_612_000, 20.0));
+        assert_eq!(resumed.state, QualityState::Unobserved);
+        let transition = resumed.transition.expect("the gap must end the interval");
+        assert_eq!(transition.to, QualityState::Unobserved);
+        assert_eq!(transition.effective_at_ms, 12_000);
+
+        let mut last = None;
+        for second in 3_613..=3_625 {
+            last = Some(classifier.observe(PingSample::success("target", second * 1_000, 20.0)));
+        }
+        assert_eq!(last.unwrap().state, QualityState::Stable);
     }
 
     #[test]
