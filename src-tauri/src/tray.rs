@@ -261,8 +261,15 @@ fn tray_menu<R: Runtime, M: Manager<R>>(app: &M, language: Language) -> tauri::R
         true,
         None::<&str>,
     )?;
+    let check_updates = MenuItem::with_id(
+        app,
+        "check-updates",
+        text(language, "tray.checkUpdates"),
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", text(language, "tray.quit"), true, None::<&str>)?;
-    Menu::with_items(app, &[&quick, &open, &pause, &quit])
+    Menu::with_items(app, &[&quick, &open, &pause, &check_updates, &quit])
 }
 
 pub fn handle_menu_event(app: &AppHandle, id: &str) {
@@ -274,6 +281,12 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
                 // Pausing writes to the database, which must not happen on the event loop thread.
                 let monitor = Arc::clone(&state.monitor);
                 tauri::async_runtime::spawn_blocking(move || monitor.toggle_paused());
+            }
+        }
+        "check-updates" => {
+            if let Some(manager) = app.try_state::<crate::updater::UpdateManager>() {
+                let manager = manager.inner().clone();
+                tauri::async_runtime::spawn(async move { manager.check_manually().await });
             }
         }
         "quit" => {

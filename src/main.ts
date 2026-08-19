@@ -109,6 +109,13 @@ async function bootstrap(): Promise<void> {
     preserveViewState();
     window.setTimeout(() => location.reload(), 50);
   });
+  // Result of a check the user started from the tray. It has to say something either way, or the
+  // menu item looks broken when the app is already up to date.
+  await listen<"checking" | "upToDate" | "failed">("update-check", (event) => {
+    if (event.payload === "checking") showToast(t("update.checking"), "info");
+    else if (event.payload === "upToDate") showToast(t("update.upToDate"), "success");
+    else showToast(formatError({ code: "updateCheck", detail: null }), "error");
+  });
   await listen<UpdateInfo>("update-available", (event) => {
     void showAvailableUpdate(event.payload);
   });
