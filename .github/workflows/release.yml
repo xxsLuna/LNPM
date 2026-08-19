@@ -77,11 +77,16 @@ jobs:
           # A draft is not addressable by tag, so an existing one has to be found in the list — but
           # a release created moments ago does not appear there yet, so a new one takes its id from
           # the creation response instead of from a follow-up query.
+          #
+          # Deleting and re-pushing a tag detaches the draft that was pointing at it: GitHub renames
+          # its tag to "untagged-…", which is why the match also accepts the release name and why
+          # the update below always writes the tag back.
           release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-            --jq "[.[] | select(.tag_name == \"$GITHUB_REF_NAME\")] | first | .id // empty")"
+            --jq "[.[] | select(.tag_name == \"$GITHUB_REF_NAME\" or (.draft and .name == \"LNPM $GITHUB_REF_NAME\"))] | first | .id // empty")"
           if [ -n "$release_id" ]; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-              -f name="LNPM $GITHUB_REF_NAME" -F body=@notes.md -F draft=true --jq .id
+              -f tag_name="$GITHUB_REF_NAME" -f name="LNPM $GITHUB_REF_NAME" \
+              -F body=@notes.md -F draft=true --jq .id
           else
             release_id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
               -f tag_name="$GITHUB_REF_NAME" -f name="LNPM $GITHUB_REF_NAME" \
