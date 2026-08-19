@@ -1,5 +1,10 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
@@ -10,6 +15,14 @@ use crate::domain::{
 };
 
 const SCHEMA_VERSION: i64 = 1;
+/// Retention deletes are issued one time slice at a time so a single statement can never hold the
+/// write lock for long.
+const CLEANUP_SLICE_MS: i64 = 6 * 3_600_000;
+const AUTO_VACUUM_INCREMENTAL: i64 = 2;
+/// Rewriting the whole file is only worth its write lock once this much space can come back.
+const COMPACT_THRESHOLD_BYTES: i64 = 32 * 1_024 * 1_024;
+/// Pages returned per incremental-vacuum statement, so each one is a short transaction.
+const VACUUM_SLICE_PAGES: u32 = 512;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -29,6 +42,12 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub struct Database {
     data_directory: PathBuf,
     database_path: PathBuf,
+    /// One connection stays open for as long as the database is in use. SQLite checkpoints and
+    /// truncates the write-ahead log whenever the *last* connection closes, so without this every
+    /// probe write — five a second — paid for a checkpoint of the whole database.
+    _keeper: Arc<Mutex<Connection>>,
+    /// Serialises read-modify-write cycles over the single settings row.
+    settings_lock: Arc<Mutex<()>>,
 }
 
 impl Database {
@@ -36,6 +55,8 @@ impl Database {
         fs::create_dir_all(&data_directory)?;
         let database_path = data_directory.join("lnpm.sqlite3");
         let database = Self {
+            _keeper: Arc::new(Mutex::new(open_connection(&database_path)?)),
+            settings_lock: Arc::new(Mutex::new(())),
             data_directory,
             database_path,
         };
@@ -208,13 +229,36 @@ impl Database {
         Ok(())
     }
 
+    /// Closes intervals a previous session left open, clamped to the last sample that session
+    /// actually recorded. Stamping `end_ms = now` instead would attribute every minute the process
+    /// was not running to whatever state the target was in when it stopped.
     pub fn close_open_intervals(&self, timestamp_ms: i64) -> StorageResult<u64> {
         let connection = self.open()?;
         let changed = connection.execute(
-            "UPDATE quality_intervals SET end_ms = ?1 WHERE end_ms IS NULL",
+            "UPDATE quality_intervals
+             SET end_ms = MAX(start_ms, MIN(?1, COALESCE(
+                 (SELECT MAX(timestamp_ms) FROM ping_samples
+                  WHERE target_id = quality_intervals.target_id), ?1)))
+             WHERE end_ms IS NULL",
             [timestamp_ms],
         )?;
         Ok(changed as u64)
+    }
+
+    /// Closes the open interval of a single target, used when it stops being observed (disabled or
+    /// paused) while the process keeps running.
+    pub fn close_open_intervals_for(
+        &self,
+        target_id: &str,
+        timestamp_ms: i64,
+    ) -> StorageResult<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "UPDATE quality_intervals SET end_ms = MAX(start_ms, ?2)
+             WHERE target_id = ?1 AND end_ms IS NULL",
+            params![target_id, timestamp_ms],
+        )?;
+        Ok(())
     }
 
     pub fn load_settings(&self) -> StorageResult<AppSettings> {
@@ -230,6 +274,20 @@ impl Database {
             Some(json) => Ok(serde_json::from_str(&json)?),
             None => Ok(AppSettings::default()),
         }
+    }
+
+    /// Reads, changes and writes the settings as one step. Several places mutate different parts of
+    /// the same record — the settings dialog, the updater's defer and skip — and each of them used to
+    /// load and save independently, so whichever wrote last silently discarded the other's change.
+    pub fn update_settings(
+        &self,
+        mutate: impl FnOnce(&mut AppSettings),
+    ) -> StorageResult<AppSettings> {
+        let _guard = self.settings_lock.lock();
+        let mut settings = self.load_settings()?;
+        mutate(&mut settings);
+        self.save_settings(&settings)?;
+        Ok(settings)
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> StorageResult<()> {
@@ -370,7 +428,7 @@ impl Database {
                 self.query_raw_points(target_id, from_ms, to_ms, bucket_ms)?
             };
             let intervals = self.query_intervals(target_id, from_ms, to_ms)?;
-            let summary = self.query_summary(target_id, from_ms, to_ms, &intervals)?;
+            let summary = self.query_summary(target_id, from_ms, to_ms, bucket_ms, &intervals)?;
             series.push(HistorySeries {
                 target,
                 points,
@@ -392,16 +450,113 @@ impl Database {
         };
         let cutoff_ms = unix_time_ms() - retention_days as i64 * 86_400_000;
         let connection = self.open()?;
-        let deleted = connection.execute(
-            "DELETE FROM ping_samples WHERE timestamp_ms < ?1",
+        // Read the ids from `targets` (a handful of rows, archived ones included). Asking
+        // `ping_samples` for its distinct ids would scan the entire samples table on every pass.
+        let target_ids = {
+            let mut statement = connection.prepare("SELECT id FROM targets")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut deleted = 0_u64;
+        for target_id in target_ids {
+            let oldest_ms: Option<i64> = connection.query_row(
+                "SELECT MIN(timestamp_ms) FROM ping_samples WHERE target_id = ?1",
+                [&target_id],
+                |row| row.get(0),
+            )?;
+            let Some(oldest_ms) = oldest_ms else {
+                continue;
+            };
+            // One `DELETE` for millions of rows holds the write lock for seconds and makes every
+            // concurrent probe wait; deleting per target in time slices keeps each statement short
+            // and lets it use the `(target_id, timestamp_ms)` primary key instead of scanning.
+            let mut slice_start_ms = oldest_ms;
+            while slice_start_ms < cutoff_ms {
+                let slice_end_ms = slice_start_ms
+                    .saturating_add(CLEANUP_SLICE_MS)
+                    .min(cutoff_ms);
+                deleted += connection.execute(
+                    "DELETE FROM ping_samples
+                     WHERE target_id = ?1 AND timestamp_ms >= ?2 AND timestamp_ms < ?3",
+                    params![target_id, slice_start_ms, slice_end_ms],
+                )? as u64;
+                slice_start_ms = slice_end_ms;
+            }
+        }
+
+        // Rollups and closed intervals used to be kept forever, so the database still grew without
+        // bound after retention had pruned the raw samples they summarise. The bound is aligned to
+        // the bucket grid so the minute straddling the cutoff — whose newer samples are retained —
+        // keeps its rollup.
+        connection.execute(
+            "DELETE FROM minute_rollups WHERE bucket_ms < (?1 / 60000) * 60000",
             [cutoff_ms],
         )?;
-        connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA incremental_vacuum;")?;
-        Ok(deleted as u64)
+        connection.execute(
+            "DELETE FROM quality_intervals WHERE end_ms IS NOT NULL AND end_ms < ?1",
+            [cutoff_ms],
+        )?;
+
+        if auto_vacuum_mode(&connection)? == AUTO_VACUUM_INCREMENTAL {
+            // The pragma reports one row per freed page, so a statement stepped once frees exactly
+            // one page — it has to be drained. An unbounded drain is one long write transaction
+            // though, so it is asked for a slice at a time, like the deletes above.
+            if let Err(error) = reclaim_free_pages(&connection) {
+                eprintln!("LNPM could not return free pages to the file system: {error}");
+            }
+        }
+        // After the vacuum, so the pages it freed are written back to the file rather than left in
+        // the log. Failures here do not undo the deletes that have already been committed.
+        if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+            eprintln!("LNPM could not checkpoint the write-ahead log: {error}");
+        }
+        Ok(deleted)
+    }
+
+    /// Rewrites the database to give the freed pages back to the file system, and switches a
+    /// database created before `auto_vacuum` was stamped correctly over to incremental vacuuming so
+    /// that later retention passes can reclaim space on their own. Returns whether it ran.
+    ///
+    /// `VACUUM` holds the write lock for as long as it takes to rewrite the file, so it only runs
+    /// when there is a worthwhile amount of free space to reclaim.
+    pub fn compact(&self) -> StorageResult<bool> {
+        let connection = self.open()?;
+        let incremental = auto_vacuum_mode(&connection)? == AUTO_VACUUM_INCREMENTAL;
+        let free_pages: i64 =
+            connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let page_bytes: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        // Rewriting the file locks out every writer for as long as it takes, so it has to be worth
+        // it — whatever the vacuum mode. A database still stamped NONE is converted by the same
+        // rewrite, which is the only way it can ever reclaim space by itself.
+        if free_pages * page_bytes < COMPACT_THRESHOLD_BYTES {
+            return Ok(false);
+        }
+        if !incremental {
+            connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        }
+        connection.execute_batch("VACUUM;")?;
+        // VACUUM writes the whole database through the log, so without this the freed space would
+        // reappear as an equally large log file. A checkpoint reports a lost race in its result row
+        // rather than as an error.
+        let busy: i64 =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            eprintln!("the write-ahead log could not be truncated right after compaction");
+        }
+        Ok(true)
     }
 
     pub fn storage_info(&self) -> StorageResult<StorageInfo> {
-        let database_size_bytes = self.database_path.metadata().map(|m| m.len()).unwrap_or(0);
+        let sidecar_bytes = |suffix: &str| {
+            PathBuf::from(format!("{}{suffix}", self.database_path.display()))
+                .metadata()
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        // The write-ahead log holds data that belongs to the database but not to its main file. A
+        // main file that cannot be measured is an error, not a database of zero bytes.
+        let database_size_bytes = self.database_path.metadata()?.len() + sidecar_bytes("-wal");
         Ok(StorageInfo {
             data_directory: self.data_directory.to_string_lossy().to_string(),
             database_path: self.database_path.to_string_lossy().to_string(),
@@ -409,24 +564,17 @@ impl Database {
         })
     }
 
-    pub fn backup_to(&self, destination: &PathBuf) -> StorageResult<()> {
-        let source = self.open()?;
-        let mut destination_connection = Connection::open(destination)?;
-        let backup = rusqlite::backup::Backup::new(&source, &mut destination_connection)?;
-        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
+    /// `VACUUM INTO` copies a consistent snapshot in a single pass. The incremental
+    /// `rusqlite::backup` API restarts from the first page whenever another connection writes the
+    /// source database, so with a probe writing every second it never reached completion.
+    pub fn backup_to(&self, destination: &Path) -> StorageResult<()> {
+        let connection = self.open()?;
+        connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
         Ok(())
     }
 
     fn open(&self) -> StorageResult<Connection> {
-        let connection = Connection::open(&self.database_path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA auto_vacuum = INCREMENTAL;",
-        )?;
-        Ok(connection)
+        open_connection(&self.database_path)
     }
 
     fn query_raw_points(
@@ -508,19 +656,31 @@ impl Database {
         target_id: &str,
         from_ms: i64,
         to_ms: i64,
+        bucket_ms: i64,
         intervals: &[QualityIntervalRecord],
     ) -> StorageResult<RangeSummary> {
         let connection = self.open()?;
-        let mut summary = connection.query_row(
+        let from_raw_samples = bucket_ms < 60_000;
+        // Minute rollups can only answer for whole minutes, so a short range summarised from them
+        // silently counted up to 59 s of samples from before the range and disagreed with the
+        // chart. Whenever the chart itself is drawn from raw samples, summarise the same rows.
+        let statement = if from_raw_samples {
+            "SELECT COUNT(*),
+                    COALESCE(SUM(status = 0), 0),
+                    COALESCE(SUM(status <> 0), 0),
+                    SUM(latency_ms), MIN(latency_ms), MAX(latency_ms)
+             FROM ping_samples
+             WHERE target_id = ?1 AND timestamp_ms >= ?2 AND timestamp_ms < ?3"
+        } else {
             "SELECT COALESCE(SUM(sample_count), 0),
                     COALESCE(SUM(success_count), 0),
                     COALESCE(SUM(failure_count), 0),
                     SUM(latency_sum), MIN(minimum_latency_ms), MAX(maximum_latency_ms)
              FROM minute_rollups
-             WHERE target_id = ?1 AND bucket_ms >= (?2 / 60000) * 60000
-               AND bucket_ms < ?3",
-            params![target_id, from_ms, to_ms],
-            |row| {
+             WHERE target_id = ?1 AND bucket_ms >= ?2 AND bucket_ms < ?3"
+        };
+        let mut summary =
+            connection.query_row(statement, params![target_id, from_ms, to_ms], |row| {
                 let sample_count: u64 = row.get(0)?;
                 let success_count: u64 = row.get(1)?;
                 let failure_count: u64 = row.get(2)?;
@@ -547,8 +707,7 @@ impl Database {
                     unstable_percent: 0.0,
                     disconnected_percent: 0.0,
                 })
-            },
-        )?;
+            })?;
 
         for interval in intervals {
             let start = interval.start_ms.max(from_ms);
@@ -568,13 +727,58 @@ impl Database {
             summary.disconnected_percent =
                 summary.disconnected_ms as f64 / monitored_ms as f64 * 100.0;
         }
-        summary.p95_latency_ms = approximate_p95(
-            self.query_raw_points(target_id, from_ms, to_ms, 60_000)?
-                .iter()
-                .filter_map(|point| point.maximum_latency_ms)
-                .collect(),
-        );
+        summary.p95_latency_ms =
+            self.query_p95(&connection, target_id, from_ms, to_ms, from_raw_samples)?;
         Ok(summary)
+    }
+
+    /// The percentile is taken over individual samples whenever the range is short enough to be
+    /// served from them. It used to be taken over per-minute *maxima* — which reports roughly the
+    /// worst sample of every minute, many times the real 95th percentile — and it re-scanned every
+    /// raw sample even for ranges that were otherwise answered from the rollups.
+    fn query_p95(
+        &self,
+        connection: &Connection,
+        target_id: &str,
+        from_ms: i64,
+        to_ms: i64,
+        from_raw_samples: bool,
+    ) -> StorageResult<Option<f64>> {
+        let (count_statement, value_statement) = if from_raw_samples {
+            (
+                "SELECT COUNT(*) FROM ping_samples
+                 WHERE target_id = ?1 AND timestamp_ms >= ?2 AND timestamp_ms < ?3
+                   AND latency_ms IS NOT NULL",
+                "SELECT latency_ms FROM ping_samples
+                 WHERE target_id = ?1 AND timestamp_ms >= ?2 AND timestamp_ms < ?3
+                   AND latency_ms IS NOT NULL
+                 ORDER BY latency_ms LIMIT 1 OFFSET ?4",
+            )
+        } else {
+            (
+                "SELECT COUNT(*) FROM minute_rollups
+                 WHERE target_id = ?1 AND bucket_ms >= ?2 AND bucket_ms < ?3
+                   AND success_count > 0",
+                "SELECT latency_sum / success_count FROM minute_rollups
+                 WHERE target_id = ?1 AND bucket_ms >= ?2 AND bucket_ms < ?3
+                   AND success_count > 0
+                 ORDER BY latency_sum / success_count LIMIT 1 OFFSET ?4",
+            )
+        };
+        let count: i64 =
+            connection.query_row(count_statement, params![target_id, from_ms, to_ms], |row| {
+                row.get(0)
+            })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let offset = (((count as f64) * 0.95).ceil() as i64 - 1).clamp(0, count - 1);
+        let value = connection.query_row(
+            value_statement,
+            params![target_id, from_ms, to_ms, offset],
+            |row| row.get::<_, Option<f64>>(0),
+        )?;
+        Ok(value)
     }
 }
 
@@ -617,15 +821,41 @@ fn nice_bucket_size(raw_ms: i64) -> i64 {
         .unwrap_or(86_400_000)
 }
 
-fn approximate_p95(mut values: Vec<f64>) -> Option<f64> {
-    if values.is_empty() {
-        return None;
+fn open_connection(database_path: &Path) -> StorageResult<Connection> {
+    let connection = Connection::open(database_path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch(
+        // `auto_vacuum` has to come first: it can only be stamped into the header of a database that
+        // has no pages yet, and setting the journal mode already writes page 1. On an existing file
+        // it is a silent no-op, which is why `compact()` exists.
+        "PRAGMA auto_vacuum = INCREMENTAL;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA journal_size_limit = 33554432;",
+    )?;
+    Ok(connection)
+}
+
+/// Hands the freelist back to the file system a slice at a time. Each statement is its own short
+/// write transaction, so a large reclaim never blocks the probes for more than a moment.
+fn reclaim_free_pages(connection: &Connection) -> StorageResult<()> {
+    loop {
+        let mut statement =
+            connection.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_SLICE_PAGES})"))?;
+        let mut rows = statement.query([])?;
+        let mut freed = 0_u32;
+        while rows.next()?.is_some() {
+            freed += 1;
+        }
+        if freed < VACUUM_SLICE_PAGES {
+            return Ok(());
+        }
     }
-    values.sort_by(f64::total_cmp);
-    let index = (((values.len() as f64) * 0.95).ceil() as usize)
-        .saturating_sub(1)
-        .min(values.len() - 1);
-    values.get(index).copied()
+}
+
+fn auto_vacuum_mode(connection: &Connection) -> StorageResult<i64> {
+    Ok(connection.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?)
 }
 
 fn address_family_to_i64(value: AddressFamily) -> i64 {
@@ -733,7 +963,7 @@ mod tests {
         let mut target = Target::new("Cloudflare", "1.1.1.1");
         target.created_at_ms = 0;
         database.save_target(&target).unwrap();
-        let mut classifier = QualityClassifier::new(QualityThresholds::default(), 0);
+        let mut classifier = QualityClassifier::new(QualityThresholds::default(), 1_000, 0);
 
         for second in 0..12 {
             let sample =
@@ -750,6 +980,189 @@ mod tests {
         assert_eq!(history.series[0].summary.failure_count, 0);
         assert!(!history.series[0].points.is_empty());
         assert!(!history.series[0].intervals.is_empty());
+    }
+
+    fn count(database: &Database, sql: &str) -> i64 {
+        database
+            .open()
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_new_database_can_reclaim_space_incrementally() {
+        let (_directory, database) = database();
+        // `auto_vacuum` has to be stamped before anything else touches the file, otherwise the
+        // retention pass can never hand pages back and the file only ever grows.
+        assert_eq!(
+            count(&database, "PRAGMA auto_vacuum"),
+            AUTO_VACUUM_INCREMENTAL
+        );
+    }
+
+    #[test]
+    fn compact_leaves_a_database_without_reclaimable_space_alone() {
+        let (_directory, database) = database();
+        database
+            .save_target(&Target::new("Cloudflare", "1.1.1.1"))
+            .unwrap();
+        assert!(!database.compact().unwrap());
+    }
+
+    #[test]
+    fn p95_is_taken_over_samples_rather_than_per_minute_maxima() {
+        let (_directory, database) = database();
+        let mut target = Target::new("Cloudflare", "1.1.1.1");
+        target.created_at_ms = 0;
+        database.save_target(&target).unwrap();
+        let mut classifier = QualityClassifier::new(QualityThresholds::default(), 1_000, 0);
+
+        for second in 0..120_i64 {
+            let sample = PingSample::success(
+                target.id.clone(),
+                second * 1_000,
+                (second + 1) as f64, // 1 ms .. 120 ms
+            );
+            let update = classifier.observe(sample.clone());
+            database.write_sample(&sample, &update, 1_000).unwrap();
+        }
+
+        let summary = database
+            .history(std::slice::from_ref(&target.id), 0, 120_000, 100)
+            .unwrap()
+            .series[0]
+            .summary
+            .clone();
+        assert_eq!(summary.sample_count, 120);
+        assert_eq!(summary.p95_latency_ms, Some(114.0));
+        assert_eq!(summary.maximum_latency_ms, Some(120.0));
+    }
+
+    #[test]
+    fn cleanup_prunes_samples_rollups_and_intervals_beyond_retention() {
+        let (_directory, database) = database();
+        let mut target = Target::new("Cloudflare", "1.1.1.1");
+        target.created_at_ms = 0;
+        database.save_target(&target).unwrap();
+        let now_ms = unix_time_ms();
+        let stale_ms = now_ms - 40 * 86_400_000;
+
+        for (timestamp_ms, transition_state) in [
+            (stale_ms, QualityState::Stable),
+            (stale_ms + 1_000, QualityState::Unstable),
+            (now_ms - 3_600_000, QualityState::Stable),
+        ] {
+            let sample = PingSample::success(target.id.clone(), timestamp_ms, 20.0);
+            let update = ClassificationUpdate {
+                state: transition_state,
+                state_since_ms: timestamp_ms,
+                metrics: QualityMetrics::default(),
+                reasons: Vec::new(),
+                transition: Some(StateTransition {
+                    from: QualityState::WarmingUp,
+                    to: transition_state,
+                    effective_at_ms: timestamp_ms,
+                    reasons: Vec::new(),
+                }),
+            };
+            database.write_sample(&sample, &update, 1_000).unwrap();
+        }
+
+        let deleted = database.cleanup(Some(30)).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert_eq!(count(&database, "SELECT COUNT(*) FROM ping_samples"), 1);
+        assert_eq!(count(&database, "SELECT COUNT(*) FROM minute_rollups"), 1);
+        // Two intervals survive: the one that still reaches into the retained range and the one
+        // that is still open. Only the interval that ended before the cutoff is pruned.
+        assert_eq!(
+            count(&database, "SELECT COUNT(*) FROM quality_intervals"),
+            2
+        );
+        assert_eq!(
+            count(
+                &database,
+                &format!(
+                    "SELECT COUNT(*) FROM quality_intervals WHERE end_ms < {}",
+                    now_ms - 30 * 86_400_000
+                )
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM quality_intervals WHERE end_ms IS NULL"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_everything_when_retention_is_unlimited() {
+        let (_directory, database) = database();
+        let target = Target::new("Cloudflare", "1.1.1.1");
+        database.save_target(&target).unwrap();
+        let sample = PingSample::success(target.id.clone(), unix_time_ms() - 10 * 86_400_000, 20.0);
+        let mut classifier = QualityClassifier::new(QualityThresholds::default(), 1_000, 0);
+        let update = classifier.observe(sample.clone());
+        database.write_sample(&sample, &update, 1_000).unwrap();
+
+        assert_eq!(database.cleanup(None).unwrap(), 0);
+        assert_eq!(count(&database, "SELECT COUNT(*) FROM ping_samples"), 1);
+    }
+
+    #[test]
+    fn backup_writes_a_readable_copy_and_compact_keeps_the_data() {
+        let (directory, database) = database();
+        let target = Target::new("Cloudflare", "1.1.1.1");
+        database.save_target(&target).unwrap();
+        let mut classifier = QualityClassifier::new(QualityThresholds::default(), 1_000, 0);
+        for second in 0..5_i64 {
+            let sample = PingSample::success(target.id.clone(), second * 1_000, 20.0);
+            let update = classifier.observe(sample.clone());
+            database.write_sample(&sample, &update, 1_000).unwrap();
+        }
+
+        let destination = directory.path().join("backup.sqlite3");
+        database.backup_to(&destination).unwrap();
+        let copy = Connection::open(&destination).unwrap();
+        let samples: i64 = copy
+            .query_row("SELECT COUNT(*) FROM ping_samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(samples, 5);
+
+        assert!(!database.compact().unwrap());
+        assert_eq!(count(&database, "SELECT COUNT(*) FROM ping_samples"), 5);
+    }
+
+    #[test]
+    fn closing_intervals_after_a_crash_clamps_to_the_last_sample() {
+        let (_directory, database) = database();
+        let target = Target::new("Offline", "192.0.2.1");
+        database.save_target(&target).unwrap();
+        let sample = PingSample::success(target.id.clone(), 5_000, 20.0);
+        let update = ClassificationUpdate {
+            state: QualityState::Stable,
+            state_since_ms: 1_000,
+            metrics: QualityMetrics::default(),
+            reasons: Vec::new(),
+            transition: Some(StateTransition {
+                from: QualityState::WarmingUp,
+                to: QualityState::Stable,
+                effective_at_ms: 1_000,
+                reasons: Vec::new(),
+            }),
+        };
+        database.write_sample(&sample, &update, 1_000).unwrap();
+
+        // A day later the app starts again: the gap must not be reported as monitored time.
+        assert_eq!(database.close_open_intervals(86_400_000).unwrap(), 1);
+        assert_eq!(
+            count(&database, "SELECT end_ms FROM quality_intervals"),
+            5_000
+        );
     }
 
     #[test]

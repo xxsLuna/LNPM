@@ -65,7 +65,9 @@ impl Target {
             enabled: true,
             address_family: AddressFamily::Auto,
             interval_ms: 1_000,
-            timeout_ms: 1_000,
+            // Deliberately below the interval: a timeout equal to it consumes the whole tick during
+            // an outage, so the sampling rate halves exactly when detection matters.
+            timeout_ms: 800,
             thresholds: QualityThresholds::default(),
             created_at_ms: unix_time_ms(),
             archived_at_ms: None,
@@ -73,6 +75,25 @@ impl Target {
     }
 
     pub fn validate(&self) -> Result<(), TargetValidationError> {
+        self.validate_probe()?;
+        // A blank name is persisted verbatim and then every message that interpolates it — tray
+        // tooltip, notifications, the delete confirmation — reads as if it lost the target.
+        if self.name.trim().is_empty() {
+            return Err(TargetValidationError::NameRequired);
+        }
+        if !(1_000..=60_000).contains(&self.interval_ms) {
+            return Err(TargetValidationError::IntervalRange);
+        }
+        if self.timeout_ms > self.interval_ms {
+            return Err(TargetValidationError::TimeoutInterval);
+        }
+        Ok(())
+    }
+
+    /// Validation for a single test probe. The sampling interval plays no part in it, so the rule
+    /// that ties the timeout to the interval must not block the "Test ping" button while the form is
+    /// still being edited.
+    pub fn validate_probe(&self) -> Result<(), TargetValidationError> {
         let host = self.host.trim();
         if host.is_empty() {
             return Err(TargetValidationError::HostRequired);
@@ -80,14 +101,8 @@ impl Target {
         if host.contains("://") || host.contains('/') || host.contains(' ') {
             return Err(TargetValidationError::InvalidHost);
         }
-        if !(1_000..=60_000).contains(&self.interval_ms) {
-            return Err(TargetValidationError::IntervalRange);
-        }
         if !(250..=10_000).contains(&self.timeout_ms) {
             return Err(TargetValidationError::TimeoutRange);
-        }
-        if self.timeout_ms > self.interval_ms {
-            return Err(TargetValidationError::TimeoutInterval);
         }
         Ok(())
     }
@@ -95,6 +110,8 @@ impl Target {
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum TargetValidationError {
+    #[error("Name is required")]
+    NameRequired,
     #[error("Host is required")]
     HostRequired,
     #[error("Enter a hostname or IP address without a URL scheme or path")]
@@ -110,6 +127,7 @@ pub enum TargetValidationError {
 impl TargetValidationError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::NameRequired => "nameRequired",
             Self::HostRequired => "hostRequired",
             Self::InvalidHost => "invalidHost",
             Self::IntervalRange => "intervalRange",

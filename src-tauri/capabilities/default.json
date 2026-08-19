@@ -5,6 +5,7 @@
   "windows": ["main", "popup"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "opener:allow-open-path"
   ]
 }

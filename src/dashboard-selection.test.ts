@@ -106,8 +106,58 @@ describe("all-monitor selection", () => {
       packetLossPercent: 50,
       averageLatencyMs: 28,
       p95LatencyMs: 300,
-      unstablePercent: 20,
-      disconnectedPercent: 15,
+      // Shares of the worst monitor's own monitored time, so they add up within one monitor.
+      stablePercent: 50,
+      unstablePercent: 30,
+      disconnectedPercent: 20,
+    });
+    // Monitor time is reported for the monitor that fared worst — never a sum, which could claim
+    // more trouble than the range is long, and never an average, which would hide one outage.
+    expect(aggregate).toMatchObject({
+      stableMs: 500,
+      unstableMs: 300,
+      disconnectedMs: 200,
+    });
+  });
+
+  it("reports the worst monitor's share of monitored time", () => {
+    const summary: RangeSummary = {
+      sampleCount: 10,
+      successCount: 10,
+      failureCount: 0,
+      packetLossPercent: 0,
+      averageLatencyMs: 20,
+      minimumLatencyMs: 10,
+      maximumLatencyMs: 30,
+      p95LatencyMs: 28,
+      stableMs: 600,
+      unstableMs: 0,
+      disconnectedMs: 0,
+      stablePercent: 100,
+      unstablePercent: 0,
+      disconnectedPercent: 0,
+    };
+    const idle: RangeSummary = {
+      ...summary,
+      sampleCount: 0,
+      successCount: 0,
+      averageLatencyMs: null,
+      minimumLatencyMs: null,
+      maximumLatencyMs: null,
+      p95LatencyMs: null,
+      stableMs: 0,
+      stablePercent: 0,
+    };
+    const series = (id: string, value: RangeSummary): HistorySeries => ({
+      target: { ...target, id },
+      points: [],
+      intervals: [],
+      summary: value,
+    });
+
+    expect(aggregateRangeSummary([series("a", summary), series("b", idle)])).toMatchObject({
+      stableMs: 600,
+      stablePercent: 100,
     });
   });
 });

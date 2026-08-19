@@ -24,6 +24,9 @@ use crate::{
 const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const RETRY_INTERVAL: Duration = Duration::from_secs(7 * 60);
 const DEFER_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// A download that stops making progress must not hold the update dialog — and with it the quit
+/// path — open forever.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +97,10 @@ struct UpdateManagerInner {
     pending: Mutex<Option<Update>>,
     announced_version: Mutex<Option<String>>,
     checking: AtomicBool,
+    /// Guards one download+install run at a time.
+    downloading: AtomicBool,
+    /// Set only for the few hundred milliseconds around the point of no return, so that quitting
+    /// and closing the window stay possible while bytes are still moving.
     installing: AtomicBool,
     wake: Notify,
 }
@@ -107,6 +114,7 @@ impl UpdateManager {
                 pending: Mutex::new(None),
                 announced_version: Mutex::new(None),
                 checking: AtomicBool::new(false),
+                downloading: AtomicBool::new(false),
                 installing: AtomicBool::new(false),
                 wake: Notify::new(),
             }),
@@ -153,11 +161,29 @@ impl UpdateManager {
                         delay = CHECK_INTERVAL;
                     }
                     PromptDecision::Defer(duration) => {
-                        delay = duration;
+                        // Keep checking while a version is deferred. Sleeping out the whole
+                        // deferral kept the stale pending update and hid any newer release until
+                        // the day was over.
+                        if duration > CHECK_INTERVAL {
+                            self.clear_pending();
+                            delay = CHECK_INTERVAL;
+                        } else {
+                            delay = duration;
+                        }
                     }
                     PromptDecision::Prompt => {
                         self.announce_update(&info);
-                        self.inner.wake.notified().await;
+                        // Waking only on a user decision meant that ignoring the dialog stopped
+                        // update checking for the rest of the session.
+                        let decided = tokio::select! {
+                            _ = self.inner.wake.notified() => true,
+                            _ = tokio::time::sleep(CHECK_INTERVAL) => false,
+                        };
+                        // Nobody has answered the dialog yet: look for a newer release, but never
+                        // while bytes for the announced one are already being downloaded.
+                        if !decided && !self.inner.downloading.load(Ordering::Acquire) {
+                            self.check_once().await;
+                        }
                         delay = Duration::ZERO;
                     }
                 }
@@ -190,7 +216,17 @@ impl UpdateManager {
                 if settings.skipped_update_version.as_deref() == Some(update.version.as_str()) {
                     return CheckOutcome::NoUpdate;
                 }
-                *self.inner.pending.lock() = Some(update);
+                let mut pending = self.inner.pending.lock();
+                // Take whatever the feed now offers, as long as it is a different release: an
+                // identical answer must not churn the version the user is deciding about, but a
+                // withdrawn one has to be replaced rather than kept pending forever.
+                let supersedes = pending
+                    .as_ref()
+                    .is_none_or(|current| current.version != update.version);
+                if !supersedes {
+                    return CheckOutcome::NoUpdate;
+                }
+                *pending = Some(update);
                 CheckOutcome::Found
             }
             Ok(_) => CheckOutcome::NoUpdate,
@@ -234,10 +270,10 @@ impl UpdateManager {
 
     fn defer(&self, version: &str) -> Result<AppSettings, CommandError> {
         self.require_pending_version(version)?;
-        let mut settings = self.inner.database.load_settings()?;
-        settings.update_deferred_version = Some(version.to_string());
-        settings.update_deferred_until_ms = Some(unix_time_ms() + DEFER_INTERVAL_MS);
-        self.inner.database.save_settings(&settings)?;
+        let settings = self.inner.database.update_settings(|settings| {
+            settings.update_deferred_version = Some(version.to_string());
+            settings.update_deferred_until_ms = Some(unix_time_ms() + DEFER_INTERVAL_MS);
+        })?;
         *self.inner.announced_version.lock() = None;
         let _ = self.inner.app.emit("settings-updated", &settings);
         self.inner.wake.notify_waiters();
@@ -246,13 +282,13 @@ impl UpdateManager {
 
     fn skip(&self, version: &str) -> Result<AppSettings, CommandError> {
         self.require_pending_version(version)?;
-        let mut settings = self.inner.database.load_settings()?;
-        settings.skipped_update_version = Some(version.to_string());
-        if settings.update_deferred_version.as_deref() == Some(version) {
-            settings.update_deferred_version = None;
-            settings.update_deferred_until_ms = None;
-        }
-        self.inner.database.save_settings(&settings)?;
+        let settings = self.inner.database.update_settings(|settings| {
+            settings.skipped_update_version = Some(version.to_string());
+            if settings.update_deferred_version.as_deref() == Some(version) {
+                settings.update_deferred_version = None;
+                settings.update_deferred_until_ms = None;
+            }
+        })?;
         let _ = self.inner.app.emit("settings-updated", &settings);
         *self.inner.announced_version.lock() = None;
         self.inner.wake.notify_waiters();
@@ -260,24 +296,26 @@ impl UpdateManager {
     }
 
     async fn install(&self) -> Result<(), CommandError> {
-        if self
-            .inner
-            .installing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let Some(_guard) = ExclusiveTaskGuard::acquire(&self.inner.downloading) else {
             return Err(CommandError::new(
                 "updateBusy",
                 "an update installation is already running",
             ));
-        }
+        };
         let Some(update) = self.inner.pending.lock().clone() else {
-            self.inner.installing.store(false, Ordering::Release);
             return Err(CommandError::new(
                 "updateMissing",
                 "there is no pending update",
             ));
         };
+        // Install exactly the release the dialog offered. A check that lands in between can replace
+        // the pending update, and installing that one instead would bypass the user's decision.
+        if self.inner.announced_version.lock().as_deref() != Some(update.version.as_str()) {
+            return Err(CommandError::new(
+                "updateMissing",
+                "the pending update changed while the dialog was open",
+            ));
+        }
         let version = update.version.clone();
         let app = self.inner.app.clone();
         let progress_version = version.clone();
@@ -285,54 +323,66 @@ impl UpdateManager {
         let verifying_version = version.clone();
         let mut downloaded_bytes = 0_u64;
 
-        let bytes = update
-            .download(
-                move |chunk_length, content_length| {
-                    downloaded_bytes = downloaded_bytes.saturating_add(chunk_length as u64);
-                    let percent = content_length
-                        .filter(|total| *total > 0)
-                        .map(|total| downloaded_bytes as f64 / total as f64 * 100.0);
-                    let _ = app.emit(
-                        "update-progress",
-                        UpdateProgress {
-                            version: progress_version.clone(),
-                            status: UpdatePhase::Downloading,
-                            downloaded_bytes: Some(downloaded_bytes),
-                            total_bytes: content_length,
-                            percent,
-                        },
-                    );
-                },
-                move || {
-                    let _ = verifying_app.emit(
-                        "update-progress",
-                        UpdateProgress {
-                            version: verifying_version,
-                            status: UpdatePhase::Verifying,
-                            downloaded_bytes: None,
-                            total_bytes: None,
-                            percent: None,
-                        },
-                    );
-                },
-            )
-            .await;
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let download = update.download(
+            move |chunk_length, content_length| {
+                downloaded_bytes = downloaded_bytes.saturating_add(chunk_length as u64);
+                let percent = content_length
+                    .filter(|total| *total > 0)
+                    .map(|total| downloaded_bytes as f64 / total as f64 * 100.0);
+                let _ = app.emit(
+                    "update-progress",
+                    UpdateProgress {
+                        version: progress_version.clone(),
+                        status: UpdatePhase::Downloading,
+                        downloaded_bytes: Some(downloaded_bytes),
+                        total_bytes: content_length,
+                        percent,
+                    },
+                );
+            },
+            move || {
+                let _ = verifying_app.emit(
+                    "update-progress",
+                    UpdateProgress {
+                        version: verifying_version,
+                        status: UpdatePhase::Verifying,
+                        downloaded_bytes: None,
+                        total_bytes: None,
+                        percent: None,
+                    },
+                );
+            },
+        );
+        let bytes = match tokio::time::timeout(DOWNLOAD_TIMEOUT, download).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
                 let code = if is_signature_error(&error) {
                     "updateSignature"
                 } else {
                     "updateDownload"
                 };
-                self.fail_install(&version, code, &error);
+                self.fail_install(&version, code, &error.to_string());
                 return Err(CommandError::new(code, error));
+            }
+            Err(_) => {
+                let detail = "the update download timed out";
+                self.fail_install(&version, "updateDownload", detail);
+                return Err(CommandError::new("updateDownload", detail));
             }
         };
 
         self.emit_progress(&version, UpdatePhase::Installing, None, None, None);
+        // On Windows the plugin exits the process as soon as the installer is running, so nothing
+        // after `install` executes. Close the open quality intervals here or the time until the
+        // next launch is later reported as monitored uptime.
+        if let Some(state) = self.inner.app.try_state::<crate::commands::AppState>()
+            && let Err(error) = state.database.close_open_intervals(unix_time_ms())
+        {
+            eprintln!("Could not close quality intervals before installing: {error}");
+        }
+        self.inner.installing.store(true, Ordering::Release);
         if let Err(error) = update.install(&bytes) {
-            self.fail_install(&version, "updateInstall", &error);
+            self.fail_install(&version, "updateInstall", &error.to_string());
             return Err(CommandError::new("updateInstall", error));
         }
 
@@ -346,14 +396,14 @@ impl UpdateManager {
         Ok(())
     }
 
-    fn fail_install(&self, version: &str, code: &str, error: &TauriUpdaterError) {
+    fn fail_install(&self, version: &str, code: &str, detail: &str) {
         self.inner.installing.store(false, Ordering::Release);
         let _ = self.inner.app.emit(
             "update-error",
             UpdateFailure {
                 version: version.to_string(),
                 code: code.to_string(),
-                detail: Some(error.to_string()),
+                detail: Some(detail.to_string()),
             },
         );
     }
@@ -406,20 +456,28 @@ pub fn get_pending_update(manager: State<'_, UpdateManager>) -> Option<UpdateInf
     manager.pending_info()
 }
 
+// Both write to the database, so they are dispatched off the event loop thread like every other
+// command that touches it.
 #[tauri::command]
-pub fn defer_update(
+pub async fn defer_update(
     manager: State<'_, UpdateManager>,
     version: String,
 ) -> Result<AppSettings, CommandError> {
-    manager.defer(&version)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.defer(&version))
+        .await
+        .map_err(|error| CommandError::new("unknown", error))?
 }
 
 #[tauri::command]
-pub fn skip_update(
+pub async fn skip_update(
     manager: State<'_, UpdateManager>,
     version: String,
 ) -> Result<AppSettings, CommandError> {
-    manager.skip(&version)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.skip(&version))
+        .await
+        .map_err(|error| CommandError::new("unknown", error))?
 }
 
 #[tauri::command]
@@ -435,9 +493,10 @@ fn prompt_decision(settings: &AppSettings, version: &str, now_ms: i64) -> Prompt
         && let Some(until_ms) = settings.update_deferred_until_ms
         && until_ms > now_ms
     {
-        return PromptDecision::Defer(
-            Duration::from_millis(until_ms.saturating_sub(now_ms) as u64),
-        );
+        // Clamped to the deferral length: a clock that jumped backwards would otherwise park the
+        // updater for as long as the jump.
+        let remaining_ms = until_ms.saturating_sub(now_ms).min(DEFER_INTERVAL_MS);
+        return PromptDecision::Defer(Duration::from_millis(remaining_ms as u64));
     }
     PromptDecision::Prompt
 }
@@ -501,6 +560,20 @@ mod tests {
         assert!(ExclusiveTaskGuard::acquire(&running).is_none());
         drop(first);
         assert!(ExclusiveTaskGuard::acquire(&running).is_some());
+    }
+
+    #[test]
+    fn a_backwards_clock_jump_cannot_park_the_updater() {
+        let settings = AppSettings {
+            update_deferred_version: Some("0.3.0".into()),
+            // As if the deferral had been recorded with the clock a year ahead.
+            update_deferred_until_ms: Some(400 * 86_400_000),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            prompt_decision(&settings, "0.3.0", 0),
+            PromptDecision::Defer(Duration::from_millis(DEFER_INTERVAL_MS as u64))
+        );
     }
 
     #[test]

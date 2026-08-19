@@ -45,6 +45,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7.0.0
 
+      - name: Verify the tag matches the app version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $package = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauri = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "tag=$tag package.json=$package tauri.conf.json=$tauri Cargo.toml=$cargo"
+          # A release built from a mismatched tag publishes artifacts the updater will never offer,
+          # because latest.json advertises the version compiled into the binary.
+          if ($package -ne $tag -or $tauri -ne $tag -or $cargo -ne $tag) {
+            throw "Tag $tag does not match package.json ($package), tauri.conf.json ($tauri) and Cargo.toml ($cargo)"
+          }
+
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
