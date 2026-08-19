@@ -2,6 +2,12 @@
 
 All notable changes to LNPM are documented in this file.
 
+## 0.4.0 - 2026-08-19
+
+### Added
+
+- A tray menu item that checks for updates on demand. It reports what happened either way — through the window when it is on screen and through a notification when it is not — and it overrides a deferral or a skip of the version it finds, because asking to check means asking to see what is available.
+
 ## 0.3.0 - 2026-08-19
 
 ### Fixed
