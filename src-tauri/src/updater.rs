@@ -27,6 +27,9 @@ const DEFER_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 /// A download that stops making progress must not hold the update dialog — and with it the quit
 /// path — open forever.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a user-requested check waits out a scheduled one before giving up on it.
+const CHECK_COLLISION_ATTEMPTS: u32 = 20;
+const CHECK_COLLISION_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +87,7 @@ enum CheckReport {
     Checking,
     UpToDate,
     Failed,
+    Busy,
 }
 
 impl CheckReport {
@@ -92,6 +96,7 @@ impl CheckReport {
             Self::Checking => "checking",
             Self::UpToDate => "upToDate",
             Self::Failed => "failed",
+            Self::Busy => "busy",
         }
     }
 }
@@ -218,6 +223,12 @@ impl UpdateManager {
     }
 
     async fn check_once(&self) -> CheckOutcome {
+        self.run_check(false).await
+    }
+
+    /// `include_skipped` belongs to the caller: the scheduler must honour a skip, while a check the
+    /// user asked for has to find the release again so it can be offered.
+    async fn run_check(&self, include_skipped: bool) -> CheckOutcome {
         let Some(_guard) = ExclusiveTaskGuard::acquire(&self.inner.checking) else {
             return CheckOutcome::AlreadyRunning;
         };
@@ -231,7 +242,9 @@ impl UpdateManager {
         match result {
             Ok(Some(update)) if is_newer_version(&update.version, &update.current_version) => {
                 let settings = self.inner.database.load_settings().unwrap_or_default();
-                if settings.skipped_update_version.as_deref() == Some(update.version.as_str()) {
+                if !include_skipped
+                    && settings.skipped_update_version.as_deref() == Some(update.version.as_str())
+                {
                     return CheckOutcome::NoUpdate;
                 }
                 let mut pending = self.inner.pending.lock();
@@ -262,11 +275,19 @@ impl UpdateManager {
     /// asking to see what is available right now, so the stored postponement is cleared and the
     /// update is offered again.
     pub async fn check_manually(&self) {
+        // An update is already on its way: checking again would replace the release being installed
+        // and reset the dialog out of its progress state. Put that dialog back in front instead.
+        if self.inner.downloading.load(Ordering::Acquire)
+            || self.inner.installing.load(Ordering::Acquire)
+        {
+            self.report_check(CheckReport::Busy);
+            crate::tray::show_main_window(&self.inner.app);
+            return;
+        }
         self.report_check(CheckReport::Checking);
-        let outcome = self.check_once().await;
+        let outcome = self.await_check().await;
         let pending = self.inner.pending.lock().as_ref().map(UpdateInfo::from);
         match (outcome, pending) {
-            (CheckOutcome::AlreadyRunning, None) => {}
             (_, Some(info)) => {
                 let database = self.inner.database.clone();
                 let version = info.version.clone();
@@ -285,16 +306,32 @@ impl UpdateManager {
                 if let Ok(Ok(settings)) = cleared {
                     let _ = self.inner.app.emit("settings-updated", &settings);
                 }
-                // Announce even if this exact version was announced before: the request came from
-                // the user, so silence would look like nothing happened.
-                *self.inner.announced_version.lock() = None;
-                self.announce_update(&info);
+                // The window first, so the dialog carries the news instead of a notification
+                // duplicating it, and then an announcement that ignores the "already announced"
+                // guard — the request came from the user, so silence would look like a dead menu.
                 crate::tray::show_main_window(&self.inner.app);
+                self.announce_update_forced(&info);
                 self.inner.wake.notify_waiters();
             }
-            (CheckOutcome::Failed, None) => self.report_check(CheckReport::Failed),
+            (CheckOutcome::AlreadyRunning, None) | (CheckOutcome::Failed, None) => {
+                self.report_check(CheckReport::Failed)
+            }
             (_, None) => self.report_check(CheckReport::UpToDate),
         }
+    }
+
+    /// Runs a user-requested check, waiting out a scheduled check that happens to hold the guard.
+    /// Reporting "already running" to someone who just asked would be no answer at all.
+    async fn await_check(&self) -> CheckOutcome {
+        for _ in 0..CHECK_COLLISION_ATTEMPTS {
+            match self.run_check(true).await {
+                CheckOutcome::AlreadyRunning => {
+                    tokio::time::sleep(CHECK_COLLISION_WAIT).await;
+                }
+                outcome => return outcome,
+            }
+        }
+        CheckOutcome::AlreadyRunning
     }
 
     /// Tells the user how a manual check went, through the window if it is on screen and through a
@@ -309,6 +346,7 @@ impl UpdateManager {
         let body = match report {
             CheckReport::UpToDate => text(language, "update.upToDate"),
             CheckReport::Failed => text(language, "error.updateCheck"),
+            CheckReport::Busy => text(language, "error.updateBusy"),
             CheckReport::Checking => return,
         };
         let _ = self
@@ -333,6 +371,18 @@ impl UpdateManager {
         if !mark_announced(&mut self.inner.announced_version.lock(), &info.version) {
             return;
         }
+        self.emit_announcement(info);
+    }
+
+    /// Announces a release the user explicitly asked to see, even if it was announced before.
+    /// Clearing `announced_version` to force this would briefly disagree with the pending update,
+    /// and `install` refuses to run while those two differ.
+    fn announce_update_forced(&self, info: &UpdateInfo) {
+        *self.inner.announced_version.lock() = Some(info.version.clone());
+        self.emit_announcement(info);
+    }
+
+    fn emit_announcement(&self, info: &UpdateInfo) {
         let _ = self.inner.app.emit("update-available", info);
         if self.main_window_is_visible() {
             return;
