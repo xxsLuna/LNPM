@@ -12,23 +12,38 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_notification::NotificationExt;
+use tokio::sync::watch;
 
 use crate::{
+    commands::SharedSettings,
     domain::{
         AppSettings, DashboardSnapshot, QualityState, QualityTransitionEvent, StateTransition,
         unix_time_ms,
     },
     i18n::{Language, active_language, message, state_label, target_count, text},
     monitor::MonitorEventSink,
-    storage::Database,
 };
 
 const TRAY_ID: &str = "lnpm-tray";
 const NOTIFICATION_BATCH_WINDOW: Duration = Duration::from_millis(2_500);
+const NOTIFICATION_REPEAT_GAP_MS: i64 = 15 * 60 * 1_000;
+/// How long the tray writer waits for the tray icon to exist before looking again.
+const TRAY_WAIT: Duration = Duration::from_millis(100);
 static TRAY_ICON_SOURCE: OnceLock<(Vec<u8>, u32, u32)> = OnceLock::new();
+/// The icon and tooltip the tray should show. A probe finishing every 200 ms would otherwise rebuild
+/// and reassign both several times a second for no visible change.
+static TRAY_UPDATES: OnceLock<watch::Sender<(QualityState, String)>> = OnceLock::new();
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowVisibility {
+    label: String,
+    visible: bool,
+}
 
 #[derive(Debug, Clone)]
 struct PendingNotification {
+    target_id: String,
     target_name: String,
     state: QualityState,
 }
@@ -44,6 +59,7 @@ impl PendingNotificationBatch {
         self.transitions.insert(
             event.target.id.clone(),
             PendingNotification {
+                target_id: event.target.id.clone(),
                 target_name: event.target.name.clone(),
                 state: event.transition.to,
             },
@@ -58,25 +74,23 @@ impl PendingNotificationBatch {
 
 pub struct TauriEventSink {
     app: AppHandle,
-    database: Database,
-    last_notifications: Mutex<HashMap<(String, QualityState), i64>>,
+    settings: SharedSettings,
+    last_notifications: Arc<Mutex<HashMap<(String, QualityState), i64>>>,
     pending_notifications: Arc<Mutex<PendingNotificationBatch>>,
 }
 
 impl TauriEventSink {
-    pub fn new(app: AppHandle, database: Database) -> Arc<Self> {
+    pub fn new(app: AppHandle, settings: SharedSettings) -> Arc<Self> {
         Arc::new(Self {
             app,
-            database,
-            last_notifications: Mutex::new(HashMap::new()),
+            settings,
+            last_notifications: Arc::new(Mutex::new(HashMap::new())),
             pending_notifications: Arc::new(Mutex::new(PendingNotificationBatch::default())),
         })
     }
 
     fn queue_notification(&self, event: &QualityTransitionEvent) {
-        let Ok(settings) = self.database.load_settings() else {
-            return;
-        };
+        let settings = self.settings.lock().clone();
         let should_notify = matches!(
             event.transition.to,
             QualityState::Unstable | QualityState::Disconnected | QualityState::Stable
@@ -87,15 +101,14 @@ impl TauriEventSink {
 
         let key = (event.target.id.clone(), event.transition.to);
         let now_ms = unix_time_ms();
-        let mut notifications = self.last_notifications.lock();
-        if notifications
+        if self
+            .last_notifications
+            .lock()
             .get(&key)
-            .is_some_and(|last| now_ms - *last < 15 * 60 * 1_000)
+            .is_some_and(|last| now_ms - *last < NOTIFICATION_REPEAT_GAP_MS)
         {
             return;
         }
-        notifications.insert(key, now_ms);
-        drop(notifications);
 
         let mut pending = self.pending_notifications.lock();
         pending.replace(event);
@@ -106,22 +119,41 @@ impl TauriEventSink {
         drop(pending);
 
         let app = self.app.clone();
-        let database = self.database.clone();
+        let shared_settings = Arc::clone(&self.settings);
         let pending = Arc::clone(&self.pending_notifications);
+        let last_notifications = Arc::clone(&self.last_notifications);
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(NOTIFICATION_BATCH_WINDOW).await;
             let transitions = pending.lock().drain();
             if transitions.is_empty() {
                 return;
             }
-            let Ok(settings) = database.load_settings() else {
-                return;
-            };
+            let settings = shared_settings.lock().clone();
             if !settings.notifications_enabled {
                 return;
             }
             let body = notification_body(active_language(settings.language), &transitions);
-            let _ = app.notification().builder().title("LNPM").body(body).show();
+            if app
+                .notification()
+                .builder()
+                .title("LNPM")
+                .body(body)
+                .show()
+                .is_err()
+            {
+                return;
+            }
+            // Only the states that were really shown may start their repeat gate. Recording it when
+            // the notification was queued muted every state that the batch coalesced away.
+            let shown_at_ms = unix_time_ms();
+            let mut gate = last_notifications.lock();
+            for transition in &transitions {
+                gate.insert(
+                    (transition.target_id.clone(), transition.state),
+                    shown_at_ms,
+                );
+            }
+            gate.retain(|_, last| shown_at_ms - *last < NOTIFICATION_REPEAT_GAP_MS);
         });
     }
 }
@@ -129,9 +161,8 @@ impl TauriEventSink {
 impl MonitorEventSink for TauriEventSink {
     fn dashboard_updated(&self, snapshot: DashboardSnapshot) {
         let _ = self.app.emit("dashboard-updated", &snapshot);
-        if let Ok(settings) = self.database.load_settings() {
-            update_tray(&self.app, &snapshot, &settings);
-        }
+        let settings = self.settings.lock().clone();
+        update_tray(&self.app, &snapshot, &settings);
     }
 
     fn quality_transition(&self, event: QualityTransitionEvent) {
@@ -240,7 +271,9 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
         "open" => show_main_window(app),
         "pause" => {
             if let Some(state) = app.try_state::<crate::commands::AppState>() {
-                state.monitor.set_paused(!state.monitor.snapshot().paused);
+                // Pausing writes to the database, which must not happen on the event loop thread.
+                let monitor = Arc::clone(&state.monitor);
+                tauri::async_runtime::spawn_blocking(move || monitor.toggle_paused());
             }
         }
         "quit" => {
@@ -284,17 +317,21 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
         {
             api.prevent_close();
         }
-        WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+        // Both windows live for the whole session behind the tray icon. Letting either be destroyed
+        // (window chrome, Alt+F4) would leave the tray with nothing to show.
+        WindowEvent::CloseRequested { api, .. }
+            if window.label() == "main" || window.label() == "popup" =>
+        {
             api.prevent_close();
-            let _ = window.hide();
+            hide_window(window);
         }
         WindowEvent::Resized(_) if window.label() == "main" => {
             if window.is_minimized().unwrap_or(false) {
-                let _ = window.hide();
+                hide_window(window);
             }
         }
         WindowEvent::Focused(false) if window.label() == "popup" => {
-            let _ = window.hide();
+            hide_window(window);
         }
         _ => {}
     }
@@ -305,6 +342,33 @@ pub fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        announce_visibility(&window, true);
+    }
+}
+
+/// Tells a window's webview whether it is on screen. Hiding a Tauri window leaves the webview
+/// running and still "visible" to the Page Visibility API, so the frontend cannot tell on its own
+/// that its five-second refresh is going to waste.
+pub fn announce_visibility<R: Runtime>(window: &tauri::WebviewWindow<R>, visible: bool) {
+    // Addressed by label and carrying it in the payload: a plain `emit` fans out to every webview,
+    // and both windows run the same frontend, so hiding the popup used to switch the main window
+    // off. A label target matches window, webview and webview-window listeners alike, which a
+    // `WebviewWindow` target would not.
+    let label = window.label().to_string();
+    let _ = window.emit_to(
+        label.as_str(),
+        "window-visibility",
+        WindowVisibility {
+            label: label.clone(),
+            visible,
+        },
+    );
+}
+
+pub fn hide_window<R: Runtime>(window: &tauri::Window<R>) {
+    let _ = window.hide();
+    if let Some(webview) = window.get_webview_window(window.label()) {
+        announce_visibility(&webview, false);
     }
 }
 
@@ -315,16 +379,55 @@ pub fn show_popup_window(app: &AppHandle, cursor: Option<PhysicalPosition<f64>>)
     if let Some(cursor) = cursor
         && let Ok(size) = window.outer_size()
     {
-        let x = (cursor.x - size.width as f64 / 2.0).max(0.0) as i32;
-        let y = if cursor.y < 200.0 {
-            (cursor.y + 24.0) as i32
-        } else {
-            (cursor.y - size.height as f64 - 12.0).max(0.0) as i32
-        };
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+        let _ = window.set_position(popup_position(&window, cursor, size));
     }
     let _ = window.show();
     let _ = window.set_focus();
+    announce_visibility(&window, true);
+}
+
+/// Places the popup next to the tray icon, kept inside the work area of the display the click
+/// happened on. Clamping to `(0, 0)` instead put it on the primary monitor's top-left corner
+/// whenever the tray sat on a second display or below a taskbar.
+fn popup_position<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    cursor: PhysicalPosition<f64>,
+    size: tauri::PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let monitor = window
+        .monitor_from_point(cursor.x, cursor.y)
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten());
+    let width = size.width as i32;
+    let height = size.height as i32;
+    let mut x = cursor.x as i32 - width / 2;
+    let mut y = if let Some(monitor) = &monitor {
+        let area = monitor.work_area();
+        // Below the tray when it is at the top of the screen, above it otherwise.
+        if cursor.y as i32 <= area.position.y + area.size.height as i32 / 2 {
+            cursor.y as i32 + 24
+        } else {
+            cursor.y as i32 - height - 12
+        }
+    } else if cursor.y < 200.0 {
+        cursor.y as i32 + 24
+    } else {
+        cursor.y as i32 - height - 12
+    };
+    if let Some(monitor) = &monitor {
+        let area = monitor.work_area();
+        let left = area.position.x;
+        let top = area.position.y;
+        let right = left + area.size.width as i32 - width;
+        let bottom = top + area.size.height as i32 - height;
+        x = x.clamp(left.min(right), right.max(left));
+        y = y.clamp(top.min(bottom), bottom.max(top));
+    } else {
+        x = x.max(0);
+        y = y.max(0);
+    }
+    PhysicalPosition::new(x, y)
 }
 
 fn update_tray(app: &AppHandle, snapshot: &DashboardSnapshot, settings: &AppSettings) {
@@ -335,23 +438,64 @@ fn update_tray(app: &AppHandle, snapshot: &DashboardSnapshot, settings: &AppSett
     } else {
         state_label(language, state)
     };
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_icon(Some(status_icon(state)));
-        let _ = tray.set_tooltip(Some(format!(
-            "LNPM · {state_text} · {}",
-            target_count(language, snapshot.targets.len())
-        )));
-    }
+    let tooltip = format!(
+        "LNPM · {state_text} · {}",
+        target_count(language, snapshot.targets.len())
+    );
+    // Handed to a single writer task rather than drawn here. `set_icon`/`set_tooltip` block until
+    // the main thread services them, so holding a lock across them could deadlock the event loop,
+    // and letting several probe threads draw concurrently could leave the icon a step behind. A
+    // watch channel keeps only the newest value and one consumer applies it.
+    let updates = TRAY_UPDATES.get_or_init(|| {
+        let (sender, receiver) = watch::channel((state, tooltip.clone()));
+        spawn_tray_writer(app.clone(), receiver);
+        sender
+    });
+    updates.send_if_modified(|current| {
+        let next = (state, tooltip);
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    });
+}
+
+fn spawn_tray_writer(app: AppHandle, mut updates: watch::Receiver<(QualityState, String)>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // The first status can be produced before the tray exists. Waiting instead of consuming
+            // it matters, because an identical value is never sent twice.
+            let Some(tray) = app.tray_by_id(TRAY_ID) else {
+                tokio::time::sleep(TRAY_WAIT).await;
+                continue;
+            };
+            let (state, tooltip) = updates.borrow_and_update().clone();
+            let _ = tray.set_icon(Some(status_icon(state)));
+            let _ = tray.set_tooltip(Some(&tooltip));
+            if updates.changed().await.is_err() {
+                return;
+            }
+        }
+    });
 }
 
 fn aggregate_state(snapshot: &DashboardSnapshot) -> QualityState {
     if snapshot.paused || snapshot.targets.is_empty() {
         return QualityState::Paused;
     }
-    snapshot
+    // A single disabled target must not make the whole app report as paused: aggregate over the
+    // targets that are actually being observed, and only fall back to Paused if none are.
+    let mut observed = snapshot
         .targets
         .iter()
         .map(|target| target.state)
+        .filter(|state| *state != QualityState::Paused)
+        .peekable();
+    if observed.peek().is_none() {
+        return QualityState::Paused;
+    }
+    observed
         .max_by_key(|state| severity(*state))
         .unwrap_or(QualityState::WarmingUp)
 }
@@ -405,10 +549,52 @@ fn _transition_is_recovery(transition: &StateTransition) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{LiveTargetStatus, QualityMetrics, Target};
+
+    fn status(state: QualityState) -> LiveTargetStatus {
+        LiveTargetStatus {
+            target: Target::new("Target", "1.1.1.1"),
+            state,
+            state_since_ms: 0,
+            latest_sample: None,
+            metrics: QualityMetrics::default(),
+            reasons: Vec::new(),
+        }
+    }
+
+    fn snapshot(states: &[QualityState]) -> DashboardSnapshot {
+        DashboardSnapshot {
+            now_ms: 0,
+            paused: false,
+            targets: states.iter().copied().map(status).collect(),
+        }
+    }
+
+    #[test]
+    fn a_disabled_target_does_not_report_the_whole_app_as_paused() {
+        assert_eq!(
+            aggregate_state(&snapshot(&[QualityState::Paused, QualityState::Stable])),
+            QualityState::Stable
+        );
+        assert_eq!(
+            aggregate_state(&snapshot(&[
+                QualityState::Paused,
+                QualityState::Stable,
+                QualityState::Unstable
+            ])),
+            QualityState::Unstable
+        );
+        assert_eq!(
+            aggregate_state(&snapshot(&[QualityState::Paused])),
+            QualityState::Paused
+        );
+        assert_eq!(aggregate_state(&snapshot(&[])), QualityState::Paused);
+    }
 
     #[test]
     fn formats_one_transition_with_the_existing_specific_message() {
         let transitions = vec![PendingNotification {
+            target_id: "Google".into(),
             target_name: "Google".into(),
             state: QualityState::Unstable,
         }];
@@ -423,14 +609,17 @@ mod tests {
     fn groups_multiple_transitions_into_one_localized_message() {
         let transitions = vec![
             PendingNotification {
+                target_id: "Office".into(),
                 target_name: "Office".into(),
                 state: QualityState::Unstable,
             },
             PendingNotification {
+                target_id: "Google".into(),
                 target_name: "Google".into(),
                 state: QualityState::Unstable,
             },
             PendingNotification {
+                target_id: "Gateway".into(),
                 target_name: "Gateway".into(),
                 state: QualityState::Disconnected,
             },
